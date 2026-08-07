@@ -204,6 +204,17 @@ import Foundation
         #expect(manifest.quant?.sharedExpert.weightBits == 4)
     }
 
+    @Test func productionManifestAcceptsInt4Router() throws {
+        let (dir, config) = try Self.writeToyManifest(
+            ["quant": Self.quant(routerBits: 4)],
+            config: .gemma4_26B_A4B)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let manifest = try ManifestReader.load(directoryURL: dir, expecting: config)
+        #expect(manifest.quant?.router.weightBits == 4)
+    }
+
+    @Test func productionManifestAcceptsHistoricalInt8SharedExpert() throws {
+
     @Test func productionManifestAcceptsHistoricalInt8SharedExpert() throws {
         let (dir, config) = try Self.writeToyManifest(
             ["quant": Self.quant(sharedExpertBits: 8)],

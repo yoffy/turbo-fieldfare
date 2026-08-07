@@ -11,6 +11,7 @@ constant constexpr uint kPrefillRmsMaxSimdGroups = 8;
 constant constexpr uint kPrefillPostMaxD = 4096;
 constant constexpr uint kPrefillRouterMaxExperts = 256;
 constant constexpr uint kPrefillRouterMaxTopK = 64;
+constant bool FC_ROUTER_INT4 [[function_constant(44)]];
 constant constexpr uint kPrefillAttentionMaxSimdGroups = 16;
 constant constexpr uint kPrefillMaxTileExperts = 16;
 constant constexpr float kPrefillGeluSqrt2OverPi = 0.7978845608028654f;
@@ -501,7 +502,7 @@ kernel void prefill_router_gemma4_block(
 
     for (uint e = tid; e < NE; e += tg_size) {
         const uint n_groups = D / kPrefillGroupSize;
-        device const uint8_t* W_row = W + e * D;
+        device const uint8_t* W_row = W + (FC_ROUTER_INT4 ? e * (D / 2u) : e * D);
         device const bfloat* s_row = scales + e * n_groups;
         device const bfloat* b_row = biases + e * n_groups;
 
@@ -509,21 +510,34 @@ kernel void prefill_router_gemma4_block(
         for (uint g = 0; g < n_groups; ++g) {
             float s = float(s_row[g]);
             float b = float(b_row[g]);
-            device const uint8_t* Wg = W_row + g * kPrefillGroupSize;
+            device const uint8_t* Wg = W_row + (FC_ROUTER_INT4 ? g * (kPrefillGroupSize / 2u) : g * kPrefillGroupSize);
             device const half* xg = row_hidden + g * kPrefillGroupSize;
             device const bfloat* eg = effective_scale + g * kPrefillGroupSize;
             float dot_qx = 0.0f;
             float sum_x = 0.0f;
-            for (uint k = 0; k < kPrefillGroupSize; ++k) {
-                float q = float(uint(Wg[k]));
-                float xv = float(xg[k]) * float(eg[k]);
-                dot_qx = fma(q, xv, dot_qx);
-                sum_x += xv;
+
+            if (FC_ROUTER_INT4) {
+                for (uint k = 0; k < kPrefillGroupSize / 2u; ++k) {
+                    const uint packed = Wg[k];
+                    const float q0 = float(uint(packed & 0x0Fu));
+                    const float q1 = float(uint(packed >> 4));
+                    const float xv0 = float(xg[2u * k]) * float(eg[2u * k]);
+                    const float xv1 = float(xg[2u * k + 1u]) * float(eg[2u * k + 1u]);
+                    dot_qx = fma(q0, xv0, dot_qx);
+                    dot_qx = fma(q1, xv1, dot_qx);
+                    sum_x += xv0 + xv1;
+                }
+            } else {
+                for (uint k = 0; k < kPrefillGroupSize; ++k) {
+                    float q = float(uint(Wg[k]));
+                    float xv = float(xg[k]) * float(eg[k]);
+                    dot_qx = fma(q, xv, dot_qx);
+                    sum_x += xv;
+                }
             }
             acc = fma(s, dot_qx, acc);
             acc = fma(b, sum_x, acc);
         }
-        scores[e] = acc;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
