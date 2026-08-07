@@ -34,6 +34,7 @@ public struct Model {
     public var modelID: String { manifest.modelID }
     public var sourceSnapshotHash: String? { manifest.sourceSnapshotHash }
     public var sharedExpertWeightBits: Int { manifest.quant?.sharedExpert.weightBits ?? 8 }
+    public var routerWeightBits: Int { manifest.quant?.router.weightBits ?? 8 }
 
     let residentBuffer: ResidentBuffer
     let residentIndex: ResidentIndex

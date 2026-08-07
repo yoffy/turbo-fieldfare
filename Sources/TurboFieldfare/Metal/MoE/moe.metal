@@ -10,6 +10,7 @@ constant uint FC_ROUTER_NUM_EXPERTS [[function_constant(40)]];
 constant uint FC_ROUTER_D [[function_constant(41)]];
 constant uint FC_ROUTER_TOP_K [[function_constant(42)]];
 constant bool FC_ROUTER_USE_FC [[function_constant(43)]];
+constant bool FC_ROUTER_INT4 [[function_constant(44)]];
 
 constant uint FC_MOE_D [[function_constant(0)]];
 constant uint FC_MOE_F [[function_constant(1)]];
@@ -106,7 +107,7 @@ static inline void router_gemv_gemma4_body(
     if (e >= NE) return;
 
     const uint n_groups = DD / kMoEGroupSize;
-    device const uint8_t* W_row = W + uint(e) * DD;
+    device const uint8_t* W_row = W + uint(e) * (FC_ROUTER_INT4 ? DD / 2u : DD);
     device const bfloat* s_row = scales + uint(e) * n_groups;
     device const bfloat* b_row = biases + uint(e) * n_groups;
 
@@ -114,11 +115,21 @@ static inline void router_gemv_gemma4_body(
     for (uint g = 0; g < n_groups; ++g) {
         const float s = float(s_row[g]);
         const float b = float(b_row[g]);
-        const uint idx = g * kMoEGroupSize + lane * 2u;
-        const float q0 = float(uint(W_row[idx]));
-        const float q1 = float(uint(W_row[idx + 1u]));
-        const float x0 = float(hidden[idx]) * float(effective_scale[idx]);
-        const float x1 = float(hidden[idx + 1u]) * float(effective_scale[idx + 1u]);
+
+        float q0, q1;
+        if (FC_ROUTER_INT4) {
+            const uint byteIdx = g * (kMoEGroupSize / 2) + lane;
+            const uint packed = W_row[byteIdx];
+            q0 = float(uint(packed & 0x0Fu));
+            q1 = float(uint(packed >> 4));
+        } else {
+            const uint idx = g * kMoEGroupSize + lane * 2u;
+            q0 = float(uint(W_row[idx]));
+            q1 = float(uint(W_row[idx + 1u]));
+        }
+
+        const float x0 = float(hidden[g * kMoEGroupSize + lane * 2u]) * float(effective_scale[g * kMoEGroupSize + lane * 2u]);
+        const float x1 = float(hidden[g * kMoEGroupSize + lane * 2u + 1u]) * float(effective_scale[g * kMoEGroupSize + lane * 2u + 1u]);
         acc = fma(s, q0 * x0 + q1 * x1, acc);
         acc = fma(b, x0 + x1, acc);
     }
