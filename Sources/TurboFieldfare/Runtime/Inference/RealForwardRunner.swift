@@ -1247,7 +1247,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                         numExperts: UInt32(cfg.numExperts),
                         d: UInt32(D),
                         topK: UInt32(cfg.topKExperts),
-                        hiddenStrideElements: UInt32(D))
+                        hiddenStrideElements: UInt32(D),
+                        weightBits: model.routerWeightBits)
 
                     cb.commit()
                     waitForCompletion(cb)
@@ -1860,7 +1861,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 perExpertScale: perExpertScale.buffer,
                 perExpertScaleOffset: perExpertScale.offset,
                 outIndices: outIndices, outWeights: outWeights,
-                numExperts: UInt32(cfg.numExperts), d: D, topK: UInt32(cfg.topKExperts))
+                numExperts: UInt32(cfg.numExperts), d: D, topK: UInt32(cfg.topKExperts),
+                weightBits: model.routerWeightBits)
             cb.commit()
             let tWait = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
             waitForCompletion(cb)
