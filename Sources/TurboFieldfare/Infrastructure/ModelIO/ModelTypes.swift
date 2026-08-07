@@ -7,6 +7,7 @@ import Metal
 /// (the format's original architecture).
 public enum ModelFamily: String, Sendable, Equatable {
     case gemma4 = "gemma4"
+    case qwen35 = "qwen35"
     case qwen36 = "qwen36"
 }
 
@@ -193,6 +194,58 @@ public struct ArchConfig: Sendable, Equatable {
         return mask
     }
 
+    /// Canonical Qwen3.5-122B-A10B baseline: a 48-layer hybrid of 36
+    /// gated-DeltaNet linear-attention layers and 10 full-attention layers
+    /// (every 4th layer), 256 routed experts (top-8) plus a sigmoid-gated
+    /// shared expert, SwiGLU activations, untied lm_head, no logit softcap.
+    ///
+    /// The sliding-window slots (`numKVHeads`/`headDim`/`slidingWindow`/
+    /// `ropeTheta`) mirror the full-attention values; the architecture has no
+    /// sliding-window layers so they are never used to size storage.
+    public static let qwen35_122B_A10B = ArchConfig(
+        hiddenSize: 3072,
+        intermediateSize: 1024,
+        moeIntermediateSize: 1024,
+        numHeads: 32,
+        numKVHeads: 2,
+        numFullKVHeads: 2,
+        headDim: 256,
+        fullHeadDim: 256,
+        vocabSize: 248_320,
+        slidingWindow: 0,
+        finalLogitSoftcap: 0.0,
+        ropeTheta: 10_000_000.0,
+        fullRopeTheta: 10_000_000.0,
+        partialRotaryFactor: 0.25,
+        numLayers: 48,
+        numExperts: 256,
+        topKExperts: 8,
+        tieWordEmbeddings: false,
+        attentionKEqV: false,
+        fullAttentionLayerMask: Self.qwen35LayerMask(),
+        hiddenActivation: "silu",
+        family: .qwen35,
+        attnOutputGate: true,
+        attentionScale: 0.0625,   // 256^-0.5
+        embeddingScaledBySqrtHidden: false,
+        routerScaled: false,
+        ffnSandwichNorms: false,
+        sharedExpertGated: true,
+        ropeNeoxSubdim: true,
+        linearAttention: LinearAttentionConfig(
+            numKHeads: 16, numVHeads: 64,
+            keyHeadDim: 128, valueHeadDim: 128,
+            convKernelSize: 4)
+    )
+
+    private static func qwen35LayerMask() -> [UInt8] {
+        // Layer kinds: 2 = gated-DeltaNet linear, 1 = full attention on every
+        // 4th layer ((i + 1) % 4 == 0).
+        var mask = [UInt8](repeating: 2, count: 48)
+        for i in stride(from: 3, to: 48, by: 4) { mask[i] = 1 }
+        return mask
+    }
+
     /// Canonical Qwen3.6-35B-A3B baseline: a 40-layer hybrid of 30
     /// gated-DeltaNet linear-attention layers and 10 full-attention layers
     /// (every 4th layer), 256 routed experts (top-8) plus a sigmoid-gated
@@ -248,6 +301,7 @@ public struct ArchConfig: Sendable, Equatable {
     /// Registry keyed by `manifest.arch.family` for auto-detection at load.
     public static let knownArchitectures: [ModelFamily: ArchConfig] = [
         .gemma4: .gemma4_26B_A4B,
+        .qwen35: .qwen35_122B_A10B,
         .qwen36: .qwen36_35B_A3B,
     ]
 

@@ -44,6 +44,16 @@ public struct AppModelInstallDescriptor: Equatable, Sendable {
         rangeStagingBytes: UInt64(RemoteChunkPolicy.defaultBytes),
         reserveBytes: 1_073_741_824)
 
+    public static let qwen35 = AppModelInstallDescriptor(
+        displayName: "Qwen3.5 122B-A10B 4-bit",
+        repoID: "mlx-community/Qwen3.5-122B-A10B-4bit",
+        revision: "e9c67b08899964be5fdd069bb1b4bc8907fe68f5",
+        sourceIndexSHA256: "e6bbd20503bb8f43b7df32983a5711e7fb54785807c296614801d7209ab40222",
+        approximateDownloadBytes: 68_739_047_424,
+        installedBytes: 68_739_047_424,
+        rangeStagingBytes: UInt64(RemoteChunkPolicy.defaultBytes),
+        reserveBytes: 1_073_741_824)
+
     public static let qwen36 = AppModelInstallDescriptor(
         displayName: "Qwen3.6 35B-A3B 4-bit",
         repoID: "mlx-community/Qwen3.6-35B-A3B-4bit",
@@ -58,13 +68,18 @@ public struct AppModelInstallDescriptor: Equatable, Sendable {
     public static func descriptor(for family: ModelFamily) -> AppModelInstallDescriptor? {
         switch family {
         case .gemma4: return .default
+        case .qwen35: return .qwen35
         case .qwen36: return .qwen36
         }
     }
 
     /// Basename of the installed `.gturbo` directory for this descriptor.
     public var installDirectoryName: String {
-        self == .qwen36 ? "qwen36.gturbo" : "gemma4.gturbo"
+        switch self {
+        case .qwen35: "qwen35.gturbo"
+        case .qwen36: "qwen36.gturbo"
+        default: "gemma4.gturbo"
+        }
     }
 
     /// The descriptor the app products select at launch. Defaults to Gemma 4.
@@ -76,6 +91,7 @@ public struct AppModelInstallDescriptor: Equatable, Sendable {
         let preferenceValue = UserDefaults(suiteName: "TurboFieldfare")?
             .string(forKey: "model")
         switch environmentValue ?? preferenceValue {
+        case "qwen35": return .qwen35
         case "qwen36": return .qwen36
         default: return .default
         }

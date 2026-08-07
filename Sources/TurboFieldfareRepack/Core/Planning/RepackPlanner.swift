@@ -126,6 +126,7 @@ enum RepackPlanner {
         let routedContainer: String
         switch family {
         case .gemma4: routedContainer = ".experts.switch_glu."
+        case .qwen35: routedContainer = ".mlp.switch_mlp."
         case .qwen36: routedContainer = ".mlp.switch_mlp."
         }
         guard name.contains(routedContainer) else { return nil }
@@ -451,6 +452,7 @@ enum RepackPlanner {
                 let slot: Int
                 switch family {
                 case .gemma4: slot = slotRank(in: n)
+                case .qwen35: slot = qwenSlotRank(in: n)
                 case .qwen36: slot = qwenSlotRank(in: n)
                 }
                 return (1, li, slot, n)

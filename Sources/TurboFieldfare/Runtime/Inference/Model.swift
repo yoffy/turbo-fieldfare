@@ -111,7 +111,7 @@ public struct Model {
         switch config.family {
         case .gemma4:
             return try resident(name: "language_model.model.layers.\(L).router.proj.weight")
-        case .qwen36:
+        case .qwen35, .qwen36:
             return try resident(name: "language_model.model.layers.\(L).mlp.gate.weight")
         }
     }
@@ -131,7 +131,7 @@ public struct Model {
         switch config.family {
         case .gemma4:
             return "language_model.model.layers.\(L).mlp.\(proj).weight"
-        case .qwen36:
+        case .qwen35, .qwen36:
             return "language_model.model.layers.\(L).mlp.shared_expert.\(proj).weight"
         }
     }

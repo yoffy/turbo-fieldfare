@@ -5,6 +5,7 @@ import Foundation
 /// architecture). Raw values match the runtime's `ModelFamily`.
 enum RepackModelFamily: String, Sendable, Equatable {
     case gemma4 = "gemma4"
+    case qwen35 = "qwen35"
     case qwen36 = "qwen36"
 }
 
@@ -62,7 +63,17 @@ struct ArchInfo: Sendable, Equatable {
             throw RepackError.configJsonInvalid(path: configPath, detail: "no text_config")
         }
         if (root["model_type"] as? String) == "qwen3_5_moe" {
-            return try loadQwen36(configPath: configPath, tc: tc)
+            guard let numHiddenLayers = (tc["num_hidden_layers"] as? Int) ?? (tc["num_hidden_layers"] as? NSNumber)?.intValue else {
+                throw RepackError.configJsonInvalid(path: configPath, detail: "no num_hidden_layers")
+            }
+            switch numHiddenLayers {
+            case 48:
+                return try loadQwen35(configPath: configPath, tc: tc)
+            case 40:
+                return try loadQwen36(configPath: configPath, tc: tc)
+            default:
+                throw RepackError.configJsonInvalid(path: configPath, detail: "not supported model")
+            }
         }
         return try loadGemma4(configPath: configPath, tc: tc)
     }
@@ -132,6 +143,138 @@ struct ArchInfo: Sendable, Equatable {
             linearKeyHeadDim: 0,
             linearValueHeadDim: 0,
             linearConvKernelSize: 0)
+    }
+
+    // MARK: - Qwen 3.5 MoE (`model_type == "qwen3_5_moe"`)
+
+    private static func loadQwen35(configPath: String,
+                                   tc: [String: Any]) throws -> ArchInfo {
+        func i(_ k: String) throws -> Int {
+            guard let n = (tc[k] as? Int) ?? (tc[k] as? NSNumber)?.intValue else {
+                throw RepackError.configJsonInvalid(path: configPath, detail: "missing \(k)")
+            }
+            return n
+        }
+        guard let layerTypes = tc["layer_types"] as? [String] else {
+            throw RepackError.configJsonInvalid(path: configPath, detail: "missing layer_types")
+        }
+        var mask: [UInt8] = []
+        mask.reserveCapacity(layerTypes.count)
+        for t in layerTypes {
+            switch t {
+            case "linear_attention": mask.append(2)
+            case "full_attention":   mask.append(1)
+            default:
+                throw RepackError.configJsonInvalid(
+                    path: configPath, detail: "unknown layer_types entry \"\(t)\"")
+            }
+        }
+        let rope = (tc["rope_parameters"] as? [String: Any]) ?? [:]
+        guard let theta = (rope["rope_theta"] as? Double)
+            ?? (rope["rope_theta"] as? NSNumber)?.doubleValue else {
+            throw RepackError.configJsonInvalid(
+                path: configPath, detail: "missing rope_parameters.rope_theta")
+        }
+        guard let prf = (rope["partial_rotary_factor"] as? Double)
+            ?? (rope["partial_rotary_factor"] as? NSNumber)?.doubleValue else {
+            throw RepackError.configJsonInvalid(
+                path: configPath, detail: "missing rope_parameters.partial_rotary_factor")
+        }
+        let tie = (tc["tie_word_embeddings"] as? Bool) ?? false
+        let gate = (tc["attn_output_gate"] as? Bool) ?? false
+        let act = (tc["hidden_act"] as? String) ?? "silu"
+        let headDim = try i("head_dim")
+
+        let arch = ArchInfo(
+            hiddenSize: try i("hidden_size"),
+            intermediateSize: try i("shared_expert_intermediate_size"),
+            moeIntermediateSize: try i("moe_intermediate_size"),
+            numHeads: try i("num_attention_heads"),
+            numKVHeads: try i("num_key_value_heads"),
+            numFullKVHeads: try i("num_key_value_heads"),
+            headDim: headDim,
+            fullHeadDim: headDim,
+            vocabSize: try i("vocab_size"),
+            slidingWindow: 0,
+            finalLogitSoftcap: 0.0,
+            ropeTheta: theta,
+            fullRopeTheta: theta,
+            partialRotaryFactor: prf,
+            numLayers: try i("num_hidden_layers"),
+            numExperts: try i("num_experts"),
+            topKExperts: try i("num_experts_per_tok"),
+            tieWordEmbeddings: tie,
+            attentionKEqV: false,
+            fullAttentionLayerMask: mask,
+            hiddenActivation: act,
+            family: .qwen35,
+            attnOutputGate: gate,
+            attentionScale: 1.0 / Double(headDim).squareRoot(),
+            embeddingScaledBySqrtHidden: false,
+            routerScaled: false,
+            ffnSandwichNorms: false,
+            sharedExpertGated: true,
+            ropeNeoxSubdim: true,
+            linearNumKHeads: try i("linear_num_key_heads"),
+            linearNumVHeads: try i("linear_num_value_heads"),
+            linearKeyHeadDim: try i("linear_key_head_dim"),
+            linearValueHeadDim: try i("linear_value_head_dim"),
+            linearConvKernelSize: try i("linear_conv_kernel_dim"))
+        try crossCheckProductionQwen35(arch, configPath: configPath)
+        return arch
+    }
+
+    /// Production Qwen3.5-122B-A10B baseline (mirrors the runtime's
+    /// `ArchConfig.qwen35_122B_A10B`; the repack target has no dependency on the
+    /// runtime module). A config that matches the production shape
+    /// (hidden 3072, 48 layers) must agree on every field; toy/synthetic
+    /// configs are exempt.
+    private static func crossCheckProductionQwen35(_ a: ArchInfo,
+                                                   configPath: String) throws {
+        guard a.hiddenSize == 3072, a.numLayers == 48 else { return }
+        var expectedMask = [UInt8](repeating: 2, count: 48)
+        for i in stride(from: 3, to: 48, by: 4) { expectedMask[i] = 1 }
+        let expected = ArchInfo(
+            hiddenSize: 3072,
+            intermediateSize: 1024,
+            moeIntermediateSize: 1024,
+            numHeads: 32,
+            numKVHeads: 2,
+            numFullKVHeads: 2,
+            headDim: 256,
+            fullHeadDim: 256,
+            vocabSize: 248_320,
+            slidingWindow: 0,
+            finalLogitSoftcap: 0.0,
+            ropeTheta: 10_000_000.0,
+            fullRopeTheta: 10_000_000.0,
+            partialRotaryFactor: 0.25,
+            numLayers: 48,
+            numExperts: 256,
+            topKExperts: 8,
+            tieWordEmbeddings: false,
+            attentionKEqV: false,
+            fullAttentionLayerMask: expectedMask,
+            hiddenActivation: "silu",
+            family: .qwen35,
+            attnOutputGate: true,
+            attentionScale: 0.0625,
+            embeddingScaledBySqrtHidden: false,
+            routerScaled: false,
+            ffnSandwichNorms: false,
+            sharedExpertGated: true,
+            ropeNeoxSubdim: true,
+            linearNumKHeads: 16,
+            linearNumVHeads: 64,
+            linearKeyHeadDim: 128,
+            linearValueHeadDim: 128,
+            linearConvKernelSize: 4)
+        guard a == expected else {
+            throw RepackError.configJsonInvalid(
+                path: configPath,
+                detail: "qwen3_5_moe config does not match the pinned "
+                    + "Qwen3.5-122B-A10B architecture baseline")
+        }
     }
 
     // MARK: - Qwen 3.6 MoE (`model_type == "qwen3_5_moe"`)

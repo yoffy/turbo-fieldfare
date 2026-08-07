@@ -110,6 +110,7 @@ public actor ServerModelSession: ServerInferenceBackend {
     public nonisolated var defaultModelID: String {
         switch modelFamily {
         case .gemma4: return "gemma-4-26b-a4b-it"
+        case .qwen35: return "qwen3.5-122b-a10b"
         case .qwen36: return "qwen3.6-35b-a3b"
         }
     }

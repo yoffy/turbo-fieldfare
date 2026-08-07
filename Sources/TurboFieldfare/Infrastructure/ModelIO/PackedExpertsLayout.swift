@@ -45,6 +45,7 @@ struct PackedExpertsLayout: Sendable {
 }
 
 enum PackedExpertsLayoutReader {
+    // 64 MiB: Qwen 3.5-122B's 48 layers x 256 experts x 9 sub-tensors produce a
     // 64 MiB: Qwen 3.6's 40 layers x 256 experts x 9 sub-tensors produce a
     // ~22 MB layout.json; Gemma's is ~5 MB.
     static let defaultMaxBytes: UInt64 = 64 * 1024 * 1024

@@ -44,6 +44,18 @@ public struct SupportedModelSource: Sendable, Equatable {
         installedBytes: 14_291_921_884,
         reserveBytes: 1_073_741_824)
 
+    public static let qwen35 = SupportedModelSource(
+        name: "qwen35",
+        displayName: "Qwen3.6 35B-A3B 4-bit",
+        repoID: "mlx-community/Qwen3.5-122B-A10B-4bit",
+        revision: "e9c67b08899964be5fdd069bb1b4bc8907fe68f5",
+        sourceIndexSHA256:
+            "e6bbd20503bb8f43b7df32983a5711e7fb54785807c296614801d7209ab40222",
+        modelID: "qwen3.5-122b-a10b-4bit",
+        approximateDownloadBytes: 68_739_047_424,
+        installedBytes: 68_739_047_424,
+        reserveBytes: 1_073_741_824)
+
     /// Download estimate covers the `language_model.*` tensors plus tokenizer
     /// and metadata sidecars; the vision tower is never fetched. Installed
     /// bytes add the resident index and per-expert 16 KB page rounding
@@ -64,7 +76,7 @@ public struct SupportedModelSource: Sendable, Equatable {
     /// Default source when no `--model` selector is given.
     public static let `default` = gemma4
 
-    public static let all: [SupportedModelSource] = [gemma4, qwen36]
+    public static let all: [SupportedModelSource] = [gemma4, qwen35, qwen36]
 
     public static func named(_ name: String) -> SupportedModelSource? {
         all.first { $0.name == name }
