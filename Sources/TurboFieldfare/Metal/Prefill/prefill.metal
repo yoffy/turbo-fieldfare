@@ -11,7 +11,13 @@ constant constexpr uint kPrefillRmsMaxSimdGroups = 8;
 constant constexpr uint kPrefillPostMaxD = 4096;
 constant constexpr uint kPrefillRouterMaxExperts = 256;
 constant constexpr uint kPrefillRouterMaxTopK = 64;
-constant bool FC_ROUTER_INT4 [[function_constant(44)]];
+// FC_ROUTER_INT4 (function_constant 44) is declared in MoE/moe.metal.
+// When defined at compile time it indicates the router weights are INT4-quantized.
+static inline bool prefill_router_int4() {
+    return is_function_constant_defined(FC_ROUTER_INT4)
+         ? FC_ROUTER_INT4
+         : false;
+}
 constant constexpr uint kPrefillAttentionMaxSimdGroups = 16;
 constant constexpr uint kPrefillMaxTileExperts = 16;
 constant constexpr float kPrefillGeluSqrt2OverPi = 0.7978845608028654f;
@@ -512,7 +518,7 @@ kernel void prefill_router_gemma4_block(
 
     for (uint e = tid; e < NE; e += tg_size) {
         const uint n_groups = D / kPrefillGroupSize;
-        device const uint8_t* W_row = W + (FC_ROUTER_INT4 ? e * (D / 2u) : e * D);
+        device const uint8_t* W_row = W + (prefill_router_int4() ? e * (D / 2u) : e * D);
         device const bfloat* s_row = scales + e * n_groups;
         device const bfloat* b_row = biases + e * n_groups;
 
@@ -520,12 +526,12 @@ kernel void prefill_router_gemma4_block(
         for (uint g = 0; g < n_groups; ++g) {
             float s = float(s_row[g]);
             float b = float(b_row[g]);
-            device const uint8_t* Wg = W_row + (FC_ROUTER_INT4 ? g * (kPrefillGroupSize / 2u) : g * kPrefillGroupSize);
+            device const uint8_t* Wg = W_row + (prefill_router_int4() ? g * (kPrefillGroupSize / 2u) : g * kPrefillGroupSize);
             device const half* xg = row_hidden + g * kPrefillGroupSize;
             device const bfloat* eg = effective_scale + g * kPrefillGroupSize;
             float dot_qx = 0.0f;
             float sum_x = 0.0f;
-            if (FC_ROUTER_INT4) {
+            if (prefill_router_int4()) {
                 for (uint k = 0; k < kPrefillGroupSize / 2u; ++k) {
                     const uint packed = Wg[k];
                     const float q0 = float(uint(packed & 0x0Fu));

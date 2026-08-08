@@ -68,8 +68,8 @@ void logit_softcap_softmax(
     // Sized for the worst case of 8 SIMD-groups (256 threads / 32-lane SIMD).
     threadgroup float partial_m[kLogitMaxSimdGroups];
     threadgroup float partial_d[kLogitMaxSimdGroups];
-    threadgroup float final_m;
-    threadgroup float final_inv_d;
+    threadgroup float final_m       = 0.0f;
+    threadgroup float final_inv_d   = 0.0f;
 
     // -log-of-zero sentinel: any real logit beats this on the first compare.
     float m = -INFINITY;
