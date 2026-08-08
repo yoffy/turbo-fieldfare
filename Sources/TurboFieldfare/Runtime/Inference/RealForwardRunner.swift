@@ -485,6 +485,22 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             self.onesPerExpertScale = try bf16OnesBuffer(count: cfg.numExperts,
                                                          label: "per_expert_scale.ones")
         }
+
+        // DEBUG: verify q_proj shape for gated-attention models
+        if cfg.attnOutputGate {
+            for L in 0..<cfg.numLayers {
+                if cfg.fullAttentionLayerMask[L] == 1 {
+                    let q = try model.qProj(layer: L)
+                    let expectedRows = UInt32(2 * cfg.numHeads * cfg.fullHeadDim)
+                    let actualRows = q.shape.0
+                    print("[DEBUG-qproj] layer=\(L) family=\(cfg.family.rawValue) "
+                          + "shape=(\(q.shape.0), \(q.shape.1), \(q.shape.2), \(q.shape.3)) "
+                          + "dtype=\(q.dtype) expectedRows=\(expectedRows) actualRows=\(actualRows) "
+                          + "length=\(q.length) scaleLen=\(q.scaleLength) biasLen=\(q.biasLength)")
+                    break
+                }
+            }
+        }
     }
 
     public func reset() {
@@ -1628,6 +1644,27 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         let D    = UInt32(cfg.hiddenSize)
         let FmoE = UInt32(cfg.moeIntermediateSize)
         let eps: Float = 1e-6
+           // DEBUG: one-time config dump at position 0
+        if position == 0 {
+            print("[DEBUG-decode] START: family=\(cfg.family.rawValue) "
+                       + "hidden=\(cfg.hiddenSize) numHeads=\(cfg.numHeads) "
+                       + "numKVHeads=\(cfg.numKVHeads) numFullKVHeads=\(cfg.numFullKVHeads) "
+                       + "headDim=\(cfg.headDim) fullHeadDim=\(cfg.fullHeadDim) "
+                       + "attnOutputGate=\(cfg.attnOutputGate) attnScale=\(cfg.attentionScale) "
+                       + "ropeNeox=\(cfg.ropeNeoxSubdim) partialRotary=\(cfg.partialRotaryFactor) "
+                       + "layers=\(cfg.numLayers) experts=\(cfg.numExperts) topK=\(cfg.topKExperts)")
+            var maskDesc = ""
+            for i in 0..<cfg.numLayers {
+                let ch: Character
+                switch cfg.fullAttentionLayerMask[i] {
+                case 1: ch = "F"
+                case 2: ch = "L"
+                default: ch = "S"
+                   }
+                maskDesc += "\(i):\(ch) "
+               }
+            print("[DEBUG-decode] layerMask: \(maskDesc)")
+           }
         let embedOutScale = cfg.embeddingScaledBySqrtHidden
             ? Float(cfg.hiddenSize).squareRoot()
             : 1.0
@@ -2254,6 +2291,23 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         let qNormW = try model.qNorm(layer: L)
         let kNormW = try model.kNorm(layer: L)
         let rotaryDim = UInt32(Double(headDim) * cfg.partialRotaryFactor)
+
+         // DEBUG: one-time config dump for the first full-attn layer
+        if L == 0 || cfg.fullAttentionLayerMask[L - 1] != 1 {
+            print("[DEBUG-gated-attn] CONFIG: family=\(cfg.family.rawValue) "
+                 + "numHeads=\(cfg.numHeads) numKVHeads=\(numKV) "
+                 + "headDim=\(headDim) qDim=\(qDim) kvDim=\(kvDim) "
+                 + "qRows=\(2 * qDim) attnScale=\(cfg.attentionScale) "
+                 + "ropeNeox=\(cfg.ropeNeoxSubdim) rotaryDim=\(rotaryDim)")
+        }
+         // DEBUG: print weight shapes for first full-attn layer
+        if L == 3 {  // first full-attn layer for Qwen3.5
+            print("[DEBUG-gated-attn] L=\(L) q_proj shape=(\(q.shape.0),\(q.shape.1)) "
+                 + "k_proj shape=(\(k.shape.0),\(k.shape.1)) "
+                 + "v_proj shape=(\(v.shape.0),\(v.shape.1)) "
+                 + "o_proj shape=(\(o.shape.0),\(o.shape.1)) "
+                 + "q_norm=\(qNormW.shape.0) k_norm=\(kNormW.shape.0)")
+        }
 
         fusedQKVGEMV.encode(commandBuffer: cb,
                             qWeights: q.buffer, qWeightsOffset: Int(q.offset),
