@@ -58,12 +58,13 @@ void sigmoid_scalar_mul_fp16(
     y[tid] = half(float(y[tid]) / (1.0f + exp(-g)));
 }
 
-// Qwen 3.5/3.6 q_proj emits [2*H, D] layout: first H heads are query,
-// next H heads are gate. Split them into contiguous q [H, D] and gate [H, D]
+// Qwen 3.5/3.6 q_proj emits an interleaved [2*H, D] layout:
+// rows are [q0, g0, q1, g1, ..., q(H-1), g(H-1)] — even rows are query,
+// odd rows are gate. Deinterleave into contiguous q [H, D] and gate [H, D]
 // so the per-head norm, RoPE, and attention kernels see their usual layout.
 [[kernel, max_total_threads_per_threadgroup(256)]]
 void split_q_gate_fp16(
-    device const half* packed [[buffer(0)]],   // [H, 2*D]
+    device const half* packed [[buffer(0)]],   // [2*H, D] interleaved
     device half*       q      [[buffer(1)]],   // [H, D]
     device half*       gate   [[buffer(2)]],   // [H, D]
     constant uint&     heads  [[buffer(3)]],
@@ -74,8 +75,8 @@ void split_q_gate_fp16(
     if (tid >= total) return;
     const uint h = tid / dim;
     const uint d = tid % dim;
-    q[tid] = packed[h * dim + d];
-    gate[tid] = packed[(heads + h) * dim + d];
+    q[tid] = packed[2u * h * dim + d];
+    gate[tid] = packed[(2u * h + 1u) * dim + d];
 }
 
 // hidden[i] += delta[i] — plain pre-norm residual add for architectures

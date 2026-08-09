@@ -17,7 +17,8 @@ final class Elementwise {
         self.splitQGatePSO = try context.pipeline("split_q_gate_fp16")
     }
 
-    /// packed [H, 2D] per-head [query ; gate] → q [H, D], gate [H, D].
+    /// Deinterleave packed [2*H, D] with alternating [q0, g0, q1, g1, ...]
+    /// rows into contiguous q [H, D] and gate [H, D].
     /// `rows` > 1 processes consecutive token rows (packed stride 2*H*D,
     /// output strides H*D).
     func encodeSplitQGate(commandBuffer: MTLCommandBuffer,
