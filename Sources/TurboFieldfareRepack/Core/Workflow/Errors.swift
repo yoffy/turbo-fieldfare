@@ -5,7 +5,7 @@ public enum RepackError: Error, CustomStringConvertible {
     case fileStatFailed(path: String, errno: Int32)
     case ftruncateFailed(path: String, errno: Int32)
     case pwriteShort(path: String, expected: Int, wrote: Int, errno: Int32)
-    case preadShort(path: String, expected: Int, got: Int, errno: Int32)
+    case preadShort(path: String, expected: Int, got: Int, errno: Int32, offset: UInt64)
     case mmapFailed(path: String, errno: Int32)
     case renameFailed(from: String, to: String, errno: Int32)
     case fsyncFailed(path: String, errno: Int32)
@@ -48,6 +48,9 @@ public enum RepackError: Error, CustomStringConvertible {
     case scratchExceeded(requested: Int, limit: Int)
     case testHookStop(stage: String)
     case configurationInvalid(detail: String)
+    case localInputNotFound(path: String)
+    case localInputNotDirectory(path: String)
+    case localInputReadFailed(path: String, errno: Int32, fileType: String?)
 
     public var description: String {
         switch self {
@@ -56,8 +59,17 @@ public enum RepackError: Error, CustomStringConvertible {
         case .ftruncateFailed(let p, let e):    return "ftruncate(\(p)) failed: errno \(e)"
         case .pwriteShort(let p, let exp, let got, let e):
             return "pwrite(\(p)) short: expected \(exp), wrote \(got), errno \(e)"
-        case .preadShort(let p, let exp, let got, let e):
-            return "pread(\(p)) short: expected \(exp), got \(got), errno \(e)"
+        case .preadShort(let p, let exp, let got, let e, let off):
+            var msg = "pread(\(p)) short: expected \(exp), got \(got) at offset \(off), errno \(e)"
+            if e == 2 {
+                msg += "\n\nPossible cause: the file does not exist at the specified path"
+            } else if e == 21 {
+                msg += "\n\nPossible causes:"
+                msg += "\n  - The file may be sparse and the data block has not been allocated yet (e.g. still downloading)"
+                msg += "\n  - The file may be locked by another process"
+                msg += "\n  - The file may not be a regular file (e.g. symlink, device file)"
+            }
+            return msg
         case .mmapFailed(let p, let e):         return "mmap(\(p)) failed: errno \(e)"
         case .renameFailed(let a, let b, let e):return "rename(\(a) -> \(b)) failed: errno \(e)"
         case .fsyncFailed(let p, let e):        return "fsync(\(p)) failed: errno \(e)"
@@ -119,6 +131,19 @@ public enum RepackError: Error, CustomStringConvertible {
             return "resident index size \(r) exceeds limit \(l)"
         case .testHookStop(let s): return "test hook stop at stage \(s)"
         case .configurationInvalid(let d): return "configuration invalid: \(d)"
+        case .localInputNotFound(let p):
+            return "local input not found: \(p)"
+        case .localInputNotDirectory(let p):
+            return "local input is not a directory: \(p)"
+        case .localInputReadFailed(let p, let e, let ft):
+            var msg = "failed to read local input \(p): errno \(e)"
+            if let ft = ft {
+                msg += " (file type: \(ft))"
+              }
+            if e == 21 {
+                msg += "\n\nerrno 21 (EAGAIN) — the file may be sparse, on a FUSE filesystem, or locked by another process."
+              }
+            return msg
         }
     }
 }

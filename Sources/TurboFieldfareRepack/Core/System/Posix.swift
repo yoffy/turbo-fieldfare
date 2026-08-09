@@ -85,7 +85,8 @@ public enum Posix {
             let n = pread(fd, ptr, remaining, off)
             if n <= 0 {
                 throw RepackError.preadShort(path: path, expected: count,
-                                             got: count - remaining, errno: errno)
+                                             got: count - remaining, errno: errno,
+                                             offset: UInt64(off))
             }
             remaining -= n
             off += off_t(n)

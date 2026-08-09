@@ -37,7 +37,7 @@ struct Sha256Stream {
         var off: off_t = 0
         while true {
             let got = pread(fd, buf.baseAddress, tileBytes, off)
-            if got < 0 { throw RepackError.preadShort(path: path, expected: tileBytes, got: 0, errno: errno) }
+            if got < 0 { throw RepackError.preadShort(path: path, expected: tileBytes, got: 0, errno: errno, offset: UInt64(off)) }
             if got == 0 { break }
             hasher.update(UnsafeRawBufferPointer(start: buf.baseAddress, count: got))
             off += off_t(got)

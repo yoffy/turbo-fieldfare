@@ -65,7 +65,7 @@ public enum WriterCore {
             let want = min(remaining, WriterCore.tileBytes)
             let got = pread(fd, buf.baseAddress, want, off_t(off))
             if got <= 0 {
-                throw RepackError.preadShort(path: path, expected: want, got: 0, errno: errno)
+                throw RepackError.preadShort(path: path, expected: want, got: 0, errno: errno, offset: off)
             }
             hasher.update(UnsafeRawBufferPointer(start: buf.baseAddress, count: got))
             audit.byteCopyTiles &+= 1

@@ -183,6 +183,21 @@ public final class RemoteStreamingRepacker {
                                                            requireKnownSource: options.requireKnownSource,
                                                            metadataDirectory: paths.metadataDirectory,
                                                            audit: audit)
+           // Debug: print shard header summary
+        let debugPath = ProcessInfo.processInfo.environment["TURBOFIELDFARE_DEBUG_SHARDS"]
+        if let debugPath {
+            var lines: [String] = []
+            for header in snapshot.shardHeaders {
+                for tensor in header.tensors {
+                    let shapeStr = tensor.shape.map { String($0) }.joined(separator: ", ")
+                    lines.append(
+                         "\t\(tensor.name) shard=\(tensor.shardPath) offset=\(tensor.absoluteOffset) "
+                         + "size=\(tensor.sizeBytes) dtype=\(tensor.dtype.rawValue) shape=\(shapeStr)")
+                 }
+             }
+            let text = lines.joined(separator: "\n") + "\n"
+            try Data(text.utf8).write(to: URL(fileURLWithPath: debugPath), options: .atomic)
+         }
         try Task.checkCancellation()
         let plan = try RepackPlanner.plan(meta: snapshot.metadata,
                                           arch: snapshot.arch,
