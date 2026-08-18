@@ -224,6 +224,13 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     private var prefillChunkState = PrefillChunkCommitState()
     private var prefillScratch: PrefillChunkScratchBuffers?
 
+    /// Debug: when `TURBO_RMS_DUMP=1`, the running `hidden` residual is
+    /// read back to the CPU after every layer and its RMS + maxAbs are
+    /// printed, so a corrupted layer can be located by the first RMS blow-up.
+    private var debugRmsDump: Bool {
+        ProcessInfo.processInfo.environment["TURBO_RMS_DUMP"] == "1"
+    }
+
     private static let rdadviseBoundedMissCap = 12
     private static let rdadviseBoundedMaxCallNanos: UInt64 = 250_000
     private static let rdadviseAdaptiveMissCap = 12
@@ -1563,6 +1570,30 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     if let error = tailCB.error {
                         throw error
                     }
+                    if debugRmsDump {
+                        // `scratch.hidden` is a private GPU buffer: blit the
+                        // chunk rows out to a shared scratch buffer before the
+                        // CPU readback in `dumpHiddenRMS`.
+                        let rmsBytes = t * D * MemoryLayout<Float16>.stride
+                        guard let rmsDst = ctx.device.makeBuffer(
+                            length: rmsBytes, options: .storageModeShared) else {
+                            throw ModelError.residentBufferWrapFailed
+                        }
+                        guard let rmsCB = ctx.queue.makeCommandBuffer(),
+                              let rmsBlit = rmsCB.makeBlitCommandEncoder() else {
+                            throw ModelError.residentBufferWrapFailed
+                        }
+                        rmsBlit.copy(from: scratch.hidden,
+                                     sourceOffset: 0,
+                                     to: rmsDst,
+                                     destinationOffset: 0,
+                                     size: rmsBytes)
+                        rmsBlit.endEncoding()
+                        rmsCB.commit()
+                        waitForCompletion(rmsCB)
+                        dumpHiddenRMS(label: "prefill", layer: L,
+                                      buffer: rmsDst, count: t * D)
+                    }
                     if L + 1 < cfg.numLayers {
                         guard let nextCB = ctx.queue.makeCommandBuffer() else {
                             throw ModelError.residentBufferWrapFailed
@@ -2150,6 +2181,17 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 sharedCB: sharedCB,
                 phase1HitCB: phase1HitCB,
                 encodeAndCommitNanos: clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tCb2Start)
+            if debugRmsDump {
+                // `hidden` (this layer's output) is final once routedCB + the
+                // overlapped sharedCB / phase1HitCB have completed; wait then
+                // read the running residual back and report its RMS so the
+                // corrupted layer shows up as the first blow-up.
+                waitForCompletion(routedCB)
+                waitForCompletion(sharedCB)
+                if let phase1HitCB { waitForCompletion(phase1HitCB) }
+                dumpHiddenRMS(label: "decode p\(position)", layer: L,
+                              buffer: hidden, count: cfg.hiddenSize)
+            }
             continue
         }
         if let pending = pendingRoutedCommand {
@@ -2399,6 +2441,53 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         if let err = cb.error {
             print("CB error: \(err)")
         }
+    }
+
+    // MARK: - Debug: per-layer hidden RMS dump
+
+    /// Read back a hidden residual (FP16, [count]) and print its RMS and
+    /// max-abs value. Driven by `debugRmsDump` (`TURBO_RMS_DUMP=1`) to locate
+    /// a corrupted layer by the first RMS blow-up when a repacked model emits
+    /// garbage. The read is raw-byte based so it does not depend on a
+    /// `Float16.bitPattern` API that is absent on some toolchains.
+    private func dumpHiddenRMS(label: String, layer: Int,
+                               buffer: MTLBuffer, count: Int) {
+        let raw = buffer.contents()
+        var sumSq = 0.0
+        var maxAbs = 0.0
+        var nans = 0
+        for i in 0..<count {
+            let bits = raw.load(fromByteOffset: i * MemoryLayout<Float16>.stride,
+                                as: UInt16.self)
+            let v = Self.float16ToDouble(bits)
+            if v.isNaN { nans &+= 1; continue }
+            sumSq += v * v
+            if abs(v) > maxAbs { maxAbs = abs(v) }
+        }
+        let rms = (sumSq / Double(count)).squareRoot()
+        let kind = cfg.layerIsLinear(layer) ? "GDN"
+                 : (cfg.fullAttentionLayerMask[layer] == 1 ? "FULL" : "SWA")
+        print("[RMS-\(label)-L\(layer)/\(kind)] rms=\(String(format: "%.5f", rms)) "
+             + "maxAbs=\(String(format: "%.5f", maxAbs)) nan=\(nans)")
+    }
+
+    /// Decode an IEEE-754 half-precision (Float16) bit pattern to Double.
+    /// `Float16` has no stable `Double(_:)` initializer across toolchains, so
+    /// the 1/5/10-bit layout is decoded directly to guarantee a correct,
+    /// portable conversion for the debug readback.
+    private static func float16ToDouble(_ bits: UInt16) -> Double {
+        let sign = (bits & 0x8000) != 0 ? -1.0 : 1.0
+        let exp = Int((bits >> 10) & 0x1F)
+        let mant = Int(bits & 0x3FF)
+        if exp == 0x1F {
+            return mant == 0 ? sign * Double.infinity : Double.nan
+        }
+        if exp == 0 {
+            // Subnormal: value = mant * 2^-24.
+            return sign * Double(mant) * 0x1.0p-24
+        }
+        // Normal: value = (1 + mant/1024) * 2^(exp-15).
+        return sign * (1.0 + Double(mant) / 1024.0) * pow(2.0, Double(exp) - 15.0)
     }
 
 }
