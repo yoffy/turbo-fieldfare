@@ -1790,7 +1790,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             if isLinear {
                 // Gated-DeltaNet linear attention: no KV slots, no RoPE — a
                 // fixed-size recurrent state updated in place.
-                try encodeLinearAttentionDecode(cb, layer: L)
+                try encodeLinearAttentionDecode(cb, layer: L, position: position)
             } else if cfg.attnOutputGate {
                 // Qwen full attention: packed [query ; gate] q_proj, real
                 // v_proj, no V norm, NeoX sub-dim RoPE, sigmoid output gate.
@@ -2249,7 +2249,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     /// Gated-DeltaNet linear attention (layer mask 2), one decode step.
     /// Reads `normed`, updates the layer's recurrent state + conv tail in
     /// place, and leaves the attention-branch output in `oOut`.
-    private func encodeLinearAttentionDecode(_ cb: MTLCommandBuffer, layer L: Int) throws {
+    private func encodeLinearAttentionDecode(_ cb: MTLCommandBuffer,
+                                             layer L: Int,
+                                             position: Int) throws {
         guard let gdn, let gdnState, let gdnQKVRaw, let gdnConvOut,
               let gdnZ, let gdnA, let gdnB, let gdnY, let gdnOut else {
             preconditionFailure("linear-attention layer without GDN kernels")
@@ -2302,6 +2304,28 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     scales: outW.buffer, scalesOffset: Int(outW.scaleOffset),
                     biases: outW.buffer, biasesOffset: Int(outW.biasOffset),
                     x: gdnOut, y: oOut, m: D, n: UInt32(la.valueDim))
+
+        if debugRmsDump {
+            // `oOut` is shared and written after this call by the MoE path;
+            // snapshot it here (blit + sync) so we can attribute the L1
+            // decode blow-up to the GDN branch vs the MoE branch.
+            let rmsBytes = la.valueDim * MemoryLayout<Float16>.stride
+            guard let rmsDst = ctx.device.makeBuffer(
+                length: rmsBytes, options: .storageModeShared) else {
+                throw ModelError.residentBufferWrapFailed
+            }
+            guard let rmsCB = ctx.queue.makeCommandBuffer(),
+                  let rmsBlit = rmsCB.makeBlitCommandEncoder() else {
+                throw ModelError.residentBufferWrapFailed
+            }
+            rmsBlit.copy(from: oOut, sourceOffset: 0, to: rmsDst,
+                         destinationOffset: 0, size: rmsBytes)
+            rmsBlit.endEncoding()
+            rmsCB.commit()
+            waitForCompletion(rmsCB)
+            dumpHiddenRMS(label: "decodeGDN p\(position)", layer: L,
+                          buffer: rmsDst, count: la.valueDim)
+        }
     }
 
     /// Qwen full attention (attn_output_gate), one decode step: packed
