@@ -1593,6 +1593,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                         waitForCompletion(rmsCB)
                         dumpHiddenRMS(label: "prefill", layer: L,
                                       buffer: rmsDst, count: t * D)
+                        if cfg.layerIsLinear(L) {
+                            dumpGDNProbe(label: "prefill", layer: L,
+                                         includeShared: false)
+                        }
                     }
                     if L + 1 < cfg.numLayers {
                         guard let nextCB = ctx.queue.makeCommandBuffer() else {
@@ -1790,7 +1794,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             if isLinear {
                 // Gated-DeltaNet linear attention: no KV slots, no RoPE — a
                 // fixed-size recurrent state updated in place.
-                try encodeLinearAttentionDecode(cb, layer: L, position: position)
+                try encodeLinearAttentionDecode(cb, layer: L)
             } else if cfg.attnOutputGate {
                 // Qwen full attention: packed [query ; gate] q_proj, real
                 // v_proj, no V norm, NeoX sub-dim RoPE, sigmoid output gate.
@@ -1940,6 +1944,22 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 pendingRoutedCommand = nil
             }
             totalCb1Nanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tCb1Start - waitNanos
+
+            if debugRmsDump {
+                // At this point (cb done, MoE not yet folded in):
+                //   hidden = input + attention/GDN branch
+                //   oOut   = attention/GDN branch output (D elements)
+                //   GDN state + conv tail + intermediates are this layer's
+                //   final values for the step.
+                dumpHiddenRMS(label: "decodeAttnOut p\(position)", layer: L,
+                              buffer: oOut, count: cfg.hiddenSize)
+                dumpHiddenRMS(label: "decodeAttn p\(position)", layer: L,
+                              buffer: hidden, count: cfg.hiddenSize)
+                if cfg.layerIsLinear(L) {
+                    dumpGDNProbe(label: "decode p\(position)", layer: L,
+                                 includeShared: true)
+                }
+            }
 
             // CPU readback to fetch routed-expert blobs from disk.
             let idxPtr = outIndices.contents().bindMemory(to: UInt32.self,
@@ -2249,9 +2269,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     /// Gated-DeltaNet linear attention (layer mask 2), one decode step.
     /// Reads `normed`, updates the layer's recurrent state + conv tail in
     /// place, and leaves the attention-branch output in `oOut`.
-    private func encodeLinearAttentionDecode(_ cb: MTLCommandBuffer,
-                                             layer L: Int,
-                                             position: Int) throws {
+    private func encodeLinearAttentionDecode(_ cb: MTLCommandBuffer, layer L: Int) throws {
         guard let gdn, let gdnState, let gdnQKVRaw, let gdnConvOut,
               let gdnZ, let gdnA, let gdnB, let gdnY, let gdnOut else {
             preconditionFailure("linear-attention layer without GDN kernels")
@@ -2304,28 +2322,6 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     scales: outW.buffer, scalesOffset: Int(outW.scaleOffset),
                     biases: outW.buffer, biasesOffset: Int(outW.biasOffset),
                     x: gdnOut, y: oOut, m: D, n: UInt32(la.valueDim))
-
-        if debugRmsDump {
-            // `oOut` is shared and written after this call by the MoE path;
-            // snapshot it here (blit + sync) so we can attribute the L1
-            // decode blow-up to the GDN branch vs the MoE branch.
-            let rmsBytes = la.valueDim * MemoryLayout<Float16>.stride
-            guard let rmsDst = ctx.device.makeBuffer(
-                length: rmsBytes, options: .storageModeShared) else {
-                throw ModelError.residentBufferWrapFailed
-            }
-            guard let rmsCB = ctx.queue.makeCommandBuffer(),
-                  let rmsBlit = rmsCB.makeBlitCommandEncoder() else {
-                throw ModelError.residentBufferWrapFailed
-            }
-            rmsBlit.copy(from: oOut, sourceOffset: 0, to: rmsDst,
-                         destinationOffset: 0, size: rmsBytes)
-            rmsBlit.endEncoding()
-            rmsCB.commit()
-            waitForCompletion(rmsCB)
-            dumpHiddenRMS(label: "decodeGDN p\(position)", layer: L,
-                          buffer: rmsDst, count: la.valueDim)
-        }
     }
 
     /// Qwen full attention (attn_output_gate), one decode step: packed
@@ -2467,7 +2463,68 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         }
     }
 
-    // MARK: - Debug: per-layer hidden RMS dump
+    // MARK: - Debug: GDN intermediate probe
+
+    /// Read back a linear-attention layer's GDN intermediates and state
+    /// (all shared-mode buffers, so a direct CPU load is safe): the
+    /// FP32 recurrent state, the FP16 conv tail, the per-row conv output,
+    /// the delta-rule output `y`, and the a/b projections. Used to split
+    /// "state carried in from prefill is corrupt" from "the decode
+    /// delta-rule step corrupts it".
+    /// `includeShared` gates the per-row intermediates (convOut/y/a/b), which
+    /// live in shared scratch and only hold layer-`L`'s values in the decode
+    /// path. Prefill calls with `includeShared: false` (state + tail only,
+    /// which are per-layer and stable).
+    private func dumpGDNProbe(label: String, layer: Int, includeShared: Bool) {
+        guard cfg.layerIsLinear(layer), let gdnState else { return }
+        let la = cfg.linearAttention
+
+        let state = gdnState.stateBuffer(layer: layer)
+        let stateCount = la.numVHeads * la.valueHeadDim * la.keyHeadDim
+        let raw = state.contents()
+        var sumSq = 0.0
+        var maxAbs = 0.0
+        for i in 0..<stateCount {
+            let v = raw.load(fromByteOffset: i * MemoryLayout<Float>.stride,
+                             as: Float.self)
+            if v.isNaN || v.isInfinite { continue }
+            let dv = Double(v)
+            sumSq += dv * dv
+            if abs(dv) > maxAbs { maxAbs = abs(dv) }
+        }
+        print("[GDN-\(label)-L\(layer)] state rms=\(String(format: "%.5f", (sumSq / Double(stateCount)).squareRoot())) maxAbs=\(String(format: "%.5f", maxAbs))")
+
+        let tail = gdnState.convTailBuffer(layer: layer)
+        dumpGDNBuffer(label: label, layer: layer, name: "tail",
+                      buffer: tail, count: max(0, la.convKernelSize - 1) * la.qkvDim)
+
+        guard includeShared, let gdnConvOut, let gdnY, let gdnA, let gdnB else { return }
+        dumpGDNBuffer(label: label, layer: layer, name: "convOut",
+                      buffer: gdnConvOut, count: la.qkvDim)
+        dumpGDNBuffer(label: label, layer: layer, name: "y",
+                      buffer: gdnY, count: la.valueDim)
+        dumpGDNBuffer(label: label, layer: layer, name: "a",
+                      buffer: gdnA, count: la.numVHeads)
+        dumpGDNBuffer(label: label, layer: layer, name: "b",
+                      buffer: gdnB, count: la.numVHeads)
+    }
+
+    private func dumpGDNBuffer(label: String, layer: Int, name: String,
+                               buffer: MTLBuffer, count: Int) {
+        let raw = buffer.contents()
+        var sumSq = 0.0
+        var maxAbs = 0.0
+        var nans = 0
+        for i in 0..<count {
+            let bits = raw.load(fromByteOffset: i * MemoryLayout<Float16>.stride,
+                                as: UInt16.self)
+            let v = Self.float16ToDouble(bits)
+            if v.isNaN || v.isInfinite { nans &+= 1; continue }
+            sumSq += v * v
+            if abs(v) > maxAbs { maxAbs = abs(v) }
+        }
+        print("[GDN-\(label)-L\(layer)] \(name) rms=\(String(format: "%.5f", (sumSq / Double(count)).squareRoot())) maxAbs=\(String(format: "%.5f", maxAbs)) nanInf=\(nans)")
+    }
 
     /// Read back a hidden residual (FP16, [count]) and print its RMS and
     /// max-abs value. Driven by `debugRmsDump` (`TURBO_RMS_DUMP=1`) to locate
