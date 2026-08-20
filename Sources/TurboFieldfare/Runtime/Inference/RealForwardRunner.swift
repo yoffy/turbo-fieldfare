@@ -1596,6 +1596,11 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                         if cfg.layerIsLinear(L) {
                             dumpGDNProbe(label: "prefill", layer: L,
                                          includeShared: false)
+                            let la = cfg.linearAttention
+                            dumpGDNBuffer(label: "prefill", layer: L, name: "z",
+                                          buffer: scratch.gdnZ, count: t * la.valueDim)
+                            dumpGDNBuffer(label: "prefill", layer: L, name: "gdnOut",
+                                          buffer: scratch.attentionOutput, count: t * la.valueDim)
                         }
                     }
                     if L + 1 < cfg.numLayers {
@@ -2497,6 +2502,31 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         let tail = gdnState.convTailBuffer(layer: layer)
         dumpGDNBuffer(label: label, layer: layer, name: "tail",
                       buffer: tail, count: max(0, la.convKernelSize - 1) * la.qkvDim)
+
+        // The gated-norm weight (BF16, [valueHeadDim]) — out = rmsnorm(y) *
+        // weight * silu(z), so gdnOut's scale is set by this weight and z.
+        if let view = try? model.linearNorm(layer: layer) {
+            let count = la.valueHeadDim
+            let raw = view.buffer.contents().advanced(by: Int(view.offset))
+            var sumSq = 0.0
+            var maxAbs = 0.0
+            var minV = Double.greatestFiniteMagnitude
+            var maxV = -Double.greatestFiniteMagnitude
+            var first8 = [String]()
+            for i in 0..<count {
+                let bits = raw.load(fromByteOffset: i * MemoryLayout<UInt16>.stride,
+                                    as: UInt16.self)
+                let v = Double(Quantization.bf16ToFloat(bits))
+                if v.isNaN || v.isInfinite { continue }
+                sumSq += v * v
+                if abs(v) > maxAbs { maxAbs = abs(v) }
+                if v < minV { minV = v }
+                if v > maxV { maxV = v }
+                if i < 8 { first8.append(String(format: "%.4f", v)) }
+            }
+            print("[GDN-\(label)-L\(layer)] normW rms=\(String(format: "%.5f", (sumSq / Double(count)).squareRoot())) "
+                  + "min=\(String(format: "%.4f", minV)) max=\(String(format: "%.4f", maxV)) first8=[\(first8.joined(separator: ","))]")
+        }
 
         guard includeShared, let gdnConvOut, let gdnY, let gdnA, let gdnB,
               let gdnZ, let gdnOut else { return }
