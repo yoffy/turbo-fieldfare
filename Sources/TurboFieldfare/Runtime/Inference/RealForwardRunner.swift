@@ -2498,11 +2498,16 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         dumpGDNBuffer(label: label, layer: layer, name: "tail",
                       buffer: tail, count: max(0, la.convKernelSize - 1) * la.qkvDim)
 
-        guard includeShared, let gdnConvOut, let gdnY, let gdnA, let gdnB else { return }
+        guard includeShared, let gdnConvOut, let gdnY, let gdnA, let gdnB,
+              let gdnZ, let gdnOut else { return }
         dumpGDNBuffer(label: label, layer: layer, name: "convOut",
                       buffer: gdnConvOut, count: la.qkvDim)
         dumpGDNBuffer(label: label, layer: layer, name: "y",
                       buffer: gdnY, count: la.valueDim)
+        dumpGDNBuffer(label: label, layer: layer, name: "z",
+                      buffer: gdnZ, count: la.valueDim)
+        dumpGDNBuffer(label: label, layer: layer, name: "gdnOut",
+                      buffer: gdnOut, count: la.valueDim)
         dumpGDNBuffer(label: label, layer: layer, name: "a",
                       buffer: gdnA, count: la.numVHeads)
         dumpGDNBuffer(label: label, layer: layer, name: "b",
