@@ -1597,10 +1597,33 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                             dumpGDNProbe(label: "prefill", layer: L,
                                          includeShared: false)
                             let la = cfg.linearAttention
-                            dumpGDNBuffer(label: "prefill", layer: L, name: "z",
-                                          buffer: scratch.gdnZ, count: t * la.valueDim)
-                            dumpGDNBuffer(label: "prefill", layer: L, name: "gdnOut",
-                                          buffer: scratch.attentionOutput, count: t * la.valueDim)
+                            // `scratch.gdnZ` / `scratch.attentionOutput` are
+                            // private GPU buffers: blit before CPU readback.
+                            let gdnBytes = t * la.valueDim * MemoryLayout<Float16>.stride
+                            if let dst = ctx.device.makeBuffer(
+                                length: gdnBytes, options: .storageModeShared),
+                               let cbuf = ctx.queue.makeCommandBuffer(),
+                               let blit = cbuf.makeBlitCommandEncoder() {
+                                blit.copy(from: scratch.gdnZ, sourceOffset: 0,
+                                          to: dst, destinationOffset: 0, size: gdnBytes)
+                                blit.endEncoding()
+                                cbuf.commit()
+                                waitForCompletion(cbuf)
+                                dumpGDNBuffer(label: "prefill", layer: L, name: "z",
+                                              buffer: dst, count: t * la.valueDim)
+                            }
+                            if let dst = ctx.device.makeBuffer(
+                                length: gdnBytes, options: .storageModeShared),
+                               let cbuf = ctx.queue.makeCommandBuffer(),
+                               let blit = cbuf.makeBlitCommandEncoder() {
+                                blit.copy(from: scratch.attentionOutput, sourceOffset: 0,
+                                          to: dst, destinationOffset: 0, size: gdnBytes)
+                                blit.endEncoding()
+                                cbuf.commit()
+                                waitForCompletion(cbuf)
+                                dumpGDNBuffer(label: "prefill", layer: L, name: "gdnOut",
+                                              buffer: dst, count: t * la.valueDim)
+                            }
                         }
                     }
                     if L + 1 < cfg.numLayers {
