@@ -2551,6 +2551,74 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                   + "min=\(String(format: "%.4f", minV)) max=\(String(format: "%.4f", maxV)) first8=[\(first8.joined(separator: ","))]")
         }
 
+        // Decisive alignment check: recompute gdnOut = (y/rms(y_h)) * W *
+        // silu(z) per head from the read-back inputs and compare against the
+        // kernel's actual output. If predicted matches actual (both large),
+        // the blow-up is data-driven (y's energy lands on z's open dims);
+        // if predicted is small but actual large, the kernel/buffers differ
+        // from the data we see.
+        if includeShared, let gdnY, let gdnZ, let gdnOut,
+           let view = try? model.linearNorm(layer: layer) {
+            let dv = la.valueHeadDim
+            let Hv = la.numVHeads
+            let yRaw = gdnY.contents()
+            let zRaw = gdnZ.contents()
+            let oRaw = gdnOut.contents()
+            let wRaw = view.buffer.contents().advanced(by: Int(view.offset))
+            func yv(_ i: Int) -> Double {
+                Double(Self.float16ToDouble(yRaw.load(fromByteOffset: i * 2, as: UInt16.self)))
+            }
+            func zv(_ i: Int) -> Double {
+                Self.float16ToDouble(zRaw.load(fromByteOffset: i * 2, as: UInt16.self))
+            }
+            func ov(_ i: Int) -> Double {
+                Self.float16ToDouble(oRaw.load(fromByteOffset: i * 2, as: UInt16.self))
+            }
+            func wv(_ i: Int) -> Double {
+                Double(Quantization.bf16ToFloat(wRaw.load(fromByteOffset: i * 2, as: UInt16.self)))
+            }
+            var maxPred = 0.0
+            var maxAct = 0.0
+            var predHead = 0
+            var actHead = 0
+            for h in 0..<Hv {
+                var sumSq = 0.0
+                for i in 0..<dv {
+                    let v = yv(h * dv + i)
+                    sumSq += v * v
+                }
+                let rms = (sumSq / Double(dv)).squareRoot()
+                guard rms > 0 else { continue }
+                var pSq = 0.0
+                var aSq = 0.0
+                for i in 0..<dv {
+                    let w = (yv(h * dv + i) / rms) * wv(i) * siluDouble(zv(h * dv + i))
+                    pSq += w * w
+                    let a = ov(h * dv + i)
+                    aSq += a * a
+                }
+                let p = (pSq / Double(dv)).squareRoot()
+                let a = (aSq / Double(dv)).squareRoot()
+                if p > maxPred { maxPred = p; predHead = h }
+                if a > maxAct { maxAct = a; actHead = h }
+            }
+            // Top-5 z spikes (global) with the y value at each spike.
+            var spikes = [(idx: Int, z: Double, y: Double)]()
+            for i in 0..<(Hv * dv) {
+                let z = zv(i)
+                if spikes.count < 5 || z > spikes.last!.z {
+                    spikes.append((i, z, yv(i)))
+                    spikes.sort { $0.z > $1.z }
+                    if spikes.count > 5 { spikes.removeLast() }
+                }
+            }
+            let spikeDesc = spikes.map { s -> String in
+                "[\(s.idx)/h\(s.idx / dv) z=\(String(format: "%.3f", s.z)) y=\(String(format: "%.3f", s.y))]"
+            }.joined(separator: " ")
+            print("[GDN-\(label)-L\(layer)] align maxPredHead\(predHead)=\(String(format: "%.4f", maxPred)) "
+                  + "maxActHead\(actHead)=\(String(format: "%.4f", maxAct)) spikes \(spikeDesc)")
+        }
+
         guard includeShared, let gdnConvOut, let gdnY, let gdnA, let gdnB,
               let gdnZ, let gdnOut else { return }
         dumpGDNBuffer(label: label, layer: layer, name: "convOut",
@@ -2608,6 +2676,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                  : (cfg.fullAttentionLayerMask[layer] == 1 ? "FULL" : "SWA")
         print("[RMS-\(label)-L\(layer)/\(kind)] rms=\(String(format: "%.5f", rms)) "
              + "maxAbs=\(String(format: "%.5f", maxAbs)) nan=\(nans)")
+    }
+
+    private static func siluDouble(_ x: Double) -> Double {
+        x / (1.0 + exp(-x))
     }
 
     /// Decode an IEEE-754 half-precision (Float16) bit pattern to Double.
