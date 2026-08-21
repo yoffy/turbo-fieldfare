@@ -2644,6 +2644,50 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             print("[GDN-\(label)-L\(layer)] align maxPredHead\(predHead)=\(String(format: "%.4f", maxPred)) "
                   + "maxActHead\(actHead)=\(String(format: "%.4f", maxAct)) spikes \(spikeDesc)")
             print("[GDN-\(label)-L\(layer)] topout \(topDesc)")
+
+            // Definitive z test: recompute z[i] = normed @ W_z^T (4-bit affine)
+            // in the CPU for the top-output positions and compare to the
+            // kernel's z. If they disagree, the in_proj_z GEMV (decode fused
+            // path) is producing a wrong z; if they agree, z is correct and
+            // the anomaly is in y (the delta-rule output).
+            if let zView = try? model.linearInProjZ(layer: layer) {
+                let D = cfg.hiddenSize
+                let groups = D / 64
+                let normRaw = normed.contents()
+                func nx(_ j: Int) -> Double {
+                    Self.float16ToDouble(normRaw.load(fromByteOffset: j * 2, as: UInt16.self))
+                }
+                let wRaw = zView.buffer.contents().advanced(by: Int(zView.offset))
+                let sRaw = zView.buffer.contents().advanced(by: Int(zView.scaleOffset))
+                let bRaw = zView.buffer.contents().advanced(by: Int(zView.biasOffset))
+                for e in topOut {
+                    let i = e.idx
+                    var zrec = 0.0
+                    for g in 0..<groups {
+                        let scale = Double(Quantization.bf16ToFloat(
+                            sRaw.load(fromByteOffset: (i * groups + g) * 2, as: UInt16.self)))
+                        let bias = Double(Quantization.bf16ToFloat(
+                            bRaw.load(fromByteOffset: (i * groups + g) * 2, as: UInt16.self)))
+                        var dot = 0.0
+                        var sumx = 0.0
+                        for j in 0..<64 {
+                            let col = g * 64 + j
+                            let wbyte = wRaw.load(fromByteOffset: i * (D / 2) + col / 2,
+                                                  as: UInt8.self)
+                            let nib = (j % 2 == 0) ? Double(wbyte & 0x0F)
+                                                   : Double((wbyte >> 4) & 0x0F)
+                            let x = nx(col)
+                            dot += nib * x
+                            sumx += x
+                        }
+                        zrec += scale * dot + bias * sumx
+                    }
+                    let zk = zv(i)
+                    let ok = abs(zrec - zk) <= max(1e-3, 0.02 * abs(zrec))
+                    print("[GDN-\(label)-L\(layer)] ztest i\(i) zKernel=\(String(format: "%.4f", zk)) "
+                          + "zRecomputed=\(String(format: "%.4f", zrec)) match=\(ok ? "YES" : "NO")")
+                }
+            }
         }
 
         guard includeShared, let gdnConvOut, let gdnY, let gdnA, let gdnB,
