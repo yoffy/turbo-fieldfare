@@ -2592,7 +2592,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 var pSq = 0.0
                 var aSq = 0.0
                 for i in 0..<dv {
-                    let w = (yv(h * dv + i) / rms) * wv(i) * siluDouble(zv(h * dv + i))
+                    let w = (yv(h * dv + i) / rms) * wv(i) * Self.siluDouble(zv(h * dv + i))
                     pSq += w * w
                     let a = ov(h * dv + i)
                     aSq += a * a
