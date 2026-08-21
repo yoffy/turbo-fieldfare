@@ -2615,8 +2615,35 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             let spikeDesc = spikes.map { s -> String in
                 "[\(s.idx)/h\(s.idx / dv) z=\(String(format: "%.3f", s.z)) y=\(String(format: "%.3f", s.y))]"
             }.joined(separator: " ")
+            // Element-level truth: top-5 |gdnOut| elements with every factor,
+            // so we can see exactly what the kernel computed at its largest
+            // outputs.
+            var topOut = [(idx: Int, o: Double)]()
+            for i in 0..<(Hv * dv) {
+                let o = ov(i)
+                if topOut.count < 5 || abs(o) > abs(topOut.last!.o) {
+                    topOut.append((i, o))
+                    topOut.sort { abs($0.o) > abs($1.o) }
+                    if topOut.count > 5 { topOut.removeLast() }
+                }
+            }
+            let topDesc = topOut.map { e -> String in
+                let h = e.idx / dv
+                let i = e.idx % dv
+                let sumSq = (0..<dv).reduce(0.0) { acc, j in
+                    let v = yv(h * dv + j)
+                    return acc + v * v
+                }
+                let rms = (sumSq / Double(dv)).squareRoot()
+                let formula = (rms > 0 ? (yv(e.idx) / rms) : 0) * wv(i) * Self.siluDouble(zv(e.idx))
+                return "[i\(e.idx)/h\(h) out=\(String(format: "%.4f", e.o)) "
+                    + "y=\(String(format: "%.4f", yv(e.idx))) z=\(String(format: "%.3f", zv(e.idx))) "
+                    + "W=\(String(format: "%.3f", wv(i))) rms=\(String(format: "%.4f", rms)) "
+                    + "formula=\(String(format: "%.4f", formula))]"
+            }.joined(separator: " ")
             print("[GDN-\(label)-L\(layer)] align maxPredHead\(predHead)=\(String(format: "%.4f", maxPred)) "
                   + "maxActHead\(actHead)=\(String(format: "%.4f", maxAct)) spikes \(spikeDesc)")
+            print("[GDN-\(label)-L\(layer)] topout \(topDesc)")
         }
 
         guard includeShared, let gdnConvOut, let gdnY, let gdnA, let gdnB,
