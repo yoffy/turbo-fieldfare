@@ -2241,6 +2241,23 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 if let phase1HitCB { waitForCompletion(phase1HitCB) }
                 dumpHiddenRMS(label: "decode p\(position)", layer: L,
                               buffer: hidden, count: cfg.hiddenSize)
+                // MoE branch: h2Buf = routed(top-k weighted) + gated shared.
+                // hidden_after = hidden_before + oOut(attention/GDN) + h2Buf.
+                dumpHiddenRMS(label: "moe p\(position)", layer: L,
+                              buffer: h2Buf, count: cfg.hiddenSize)
+                // Router decision for this layer: which experts, with what
+                // weights. Garbage expert selection (4-bit router) shows up
+                // here as uniform/near-random weights and indices.
+                let idxRaw = outIndices.contents()
+                let wRaw = outWeights.contents()
+                var idxDesc = [String]()
+                var wDesc = [String]()
+                for i in 0..<cfg.topKExperts {
+                    idxDesc.append(String(idxRaw.load(fromByteOffset: i * 4, as: UInt32.self)))
+                    wDesc.append(String(format: "%.3f", Self.float16ToDouble(
+                        wRaw.load(fromByteOffset: i * 2, as: UInt16.self))))
+                }
+                print("[ROUTER-\(position)-L\(L)] idx=[\(idxDesc.joined(separator: ","))] w=[\(wDesc.joined(separator: ","))]")
             }
             continue
         }
