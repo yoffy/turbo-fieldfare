@@ -223,6 +223,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     private let onesPerExpertScale: MTLBuffer?
     private var prefillChunkState = PrefillChunkCommitState()
     private var prefillScratch: PrefillChunkScratchBuffers?
+    /// Debug: recurrent state snapshot taken just before each GDN delta step.
+    private var debugStateBefore: MTLBuffer?
 
     /// Debug: when `TURBO_RMS_DUMP=1`, the running `hidden` residual is
     /// read back to the CPU after every layer and its RMS + maxAbs are
@@ -2331,6 +2333,25 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                              convWeightOffset: Int(convW.offset),
                              out: gdnConvOut)
         gdn.encodeQKNorm(commandBuffer: cb, convOut: gdnConvOut)
+        if debugRmsDump {
+            // Snapshot the recurrent state BEFORE this step's update so the
+            // CPU reference delta-rule can be replayed against the kernel's y.
+            // Queued before `cb` (not yet committed), so it runs first.
+            let bytes = la.numVHeads * la.valueHeadDim * la.keyHeadDim
+                * MemoryLayout<Float>.stride
+            if debugStateBefore == nil {
+                debugStateBefore = ctx.device.makeBuffer(
+                    length: bytes, options: .storageModeShared)
+            }
+            if let dst = debugStateBefore,
+               let blitCB = ctx.queue.makeCommandBuffer(),
+               let blit = blitCB.makeBlitCommandEncoder() {
+                blit.copy(from: gdnState.stateBuffer(layer: L), sourceOffset: 0,
+                          to: dst, destinationOffset: 0, size: bytes)
+                blit.endEncoding()
+                blitCB.commit()
+            }
+        }
         gdn.encodeDeltaStepDecode(commandBuffer: cb,
                                   convOut: gdnConvOut,
                                   aProj: gdnA,
@@ -2644,6 +2665,85 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             print("[GDN-\(label)-L\(layer)] align maxPredHead\(predHead)=\(String(format: "%.4f", maxPred)) "
                   + "maxActHead\(actHead)=\(String(format: "%.4f", maxAct)) spikes \(spikeDesc)")
             print("[GDN-\(label)-L\(layer)] topout \(topDesc)")
+
+            // Reference delta-rule replay for the top-output positions:
+            //   S   = S_before[h][dv] * g
+            //   kv  = S[h][dv] . k[hk]
+            //   dlt = (v[h][dv] - kv) * beta
+            //   S'  = S + k[hk] * dlt
+            //   y   = S'[h][dv] . q[hk]
+            // Uses the pre-step state snapshot (debugStateBefore), q/k/v from
+            // convOut (post qk-norm), and a/b/A_log/dt_bias.
+            if let stateBefore = debugStateBefore,
+               let convOut = gdnConvOut,
+               let aProj = gdnA, let bProj = gdnB,
+               let aLogV = try? model.linearALog(layer: layer),
+               let dtV = try? model.linearDtBias(layer: layer) {
+                let Dk = la.keyHeadDim
+                let Dv = la.valueHeadDim
+                let Hk = la.numKHeads
+                let Hv = la.numVHeads
+                let ratio = Hv / Hk
+                func cval(_ i: Int) -> Double {
+                    Self.float16ToDouble(convOut.contents().load(fromByteOffset: i * 2, as: UInt16.self))
+                }
+                let sRaw2 = stateBefore.contents()
+                func sval(_ h: Int, _ dv: Int, _ j: Int) -> Double {
+                    Double(sRaw2.load(fromByteOffset: ((h * Dv + dv) * Dk + j) * 4, as: Float.self))
+                }
+                func aval(_ h: Int) -> Double {
+                    Self.float16ToDouble(aProj.contents().load(fromByteOffset: h * 2, as: UInt16.self))
+                }
+                func bval(_ h: Int) -> Double {
+                    Self.float16ToDouble(bProj.contents().load(fromByteOffset: h * 2, as: UInt16.self))
+                }
+                let aLogRaw = aLogV.buffer.contents().advanced(by: Int(aLogV.offset))
+                let dtRaw = dtV.buffer.contents().advanced(by: Int(dtV.offset))
+                func aLogval(_ h: Int) -> Double {
+                    Double(Quantization.bf16ToFloat(aLogRaw.load(fromByteOffset: h * 2, as: UInt16.self)))
+                }
+                func dtval(_ h: Int) -> Double {
+                    Double(Quantization.bf16ToFloat(dtRaw.load(fromByteOffset: h * 2, as: UInt16.self)))
+                }
+                for e in topOut {
+                    let i = e.idx
+                    let h = i / Dv
+                    let dv = i % Dv
+                    let hk = h / ratio
+                    let a = aval(h)
+                    let b = bval(h)
+                    let Alog = aLogval(h)
+                    let dtb = dtval(h)
+                    let softplus = (a + dtb) > 20.0 ? (a + dtb) : log(1.0 + exp(a + dtb))
+                    let g = exp(-exp(Alog) * softplus)
+                    let beta = 1.0 / (1.0 + exp(-b))
+                    // convOut offsets (match gdn_delta_step_decode exactly):
+                    //   q[hk][j] = convOut[hk*Dk + j]
+                    //   k[hk][j] = convOut[Hk*Dk + hk*Dk + j]
+                    //   v[h][dv] = convOut[2*Hk*Dk + h*Dv + dv] = convOut[2*Hk*Dk + i]
+                    let qOff = hk * Dk
+                    let kOff = Hk * Dk + hk * Dk
+                    let vVal = cval(2 * Hk * Dk + i)
+                    // kernel: s[i]=S_before*g ; kv += s[i]*k  =>  kv = g * Σ S_before*k
+                    var kv = 0.0
+                    for j in 0..<Dk { kv += (sval(h, dv, j) * g) * cval(kOff + j) }
+                    let delta = (vVal - kv) * beta
+                    // kernel: s[i]=s[i]+k[i]*delta ; out += s[i]*q
+                    //        => y = Σ (S_before*g + k*delta) * q
+                    var yRec = 0.0
+                    for j in 0..<Dk {
+                        let sNew = sval(h, dv, j) * g + cval(kOff + j) * delta
+                        yRec += sNew * cval(qOff + j)
+                    }
+                    let yKernel = yv(i)
+                    let rel = (yRec != 0) ? abs(yRec - yKernel) / max(abs(yRec), 1e-9) : abs(yRec - yKernel)
+                    print("[GDN-\(label)-L\(layer)] ytest i\(i)/h\(h)/dv\(dv) yK=\(String(format: "%.5f", yKernel)) "
+                          + "yR=\(String(format: "%.5f", yRec)) g=\(String(format: "%.4f", g)) "
+                          + "beta=\(String(format: "%.4f", beta)) kv=\(String(format: "%.4f", kv)) "
+                          + "delta=\(String(format: "%.4f", delta)) v=\(String(format: "%.4f", vVal)) "
+                          + "match=\(rel <= 0.05 ? "YES" : "NO")")
+                }
+            }
 
             // Definitive z test: recompute z[i] = normed @ W_z^T (4-bit affine)
             // in the CPU for the top-output positions and compare to the
