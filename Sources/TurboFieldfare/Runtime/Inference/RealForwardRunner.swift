@@ -225,6 +225,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     private var prefillScratch: PrefillChunkScratchBuffers?
     /// Debug: recurrent state snapshot taken just before each GDN delta step.
     private var debugStateBefore: MTLBuffer?
+    private var debugTailBefore: MTLBuffer?
 
     /// Debug: when `TURBO_RMS_DUMP=1`, the running `hidden` residual is
     /// read back to the CPU after every layer and its RMS + maxAbs are
@@ -2258,6 +2259,92 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                         wRaw.load(fromByteOffset: i * 2, as: UInt16.self))))
                 }
                 print("[ROUTER-\(position)-L\(L)] idx=[\(idxDesc.joined(separator: ","))] w=[\(wDesc.joined(separator: ","))]")
+
+                // CPU reference reimplementation of the decode router GEMV
+                // (router_gemv_gemma4_body) + top-k (router_topk_select_k8),
+                // to separate "the 4-bit dequant/top-k path is buggy" from
+                // "4-bit quantization itself flattens the logits". Mirrors the
+                // ztest nibble/affine dequant exactly. effective_scale and
+                // per_expert_scale are all-ones for Qwen but are applied here
+                // so the path stays correct for the Gemma routerScaled case.
+                let Di = Int(D)
+                let groups = Di / 64
+                let esRaw = effectiveScaleBuffers[L].contents()
+                let pesRaw = perExpertScale.buffer.contents().advanced(by: perExpertScale.offset)
+                let xRaw = routedX.contents()
+                var xv = [Double](repeating: 0, count: Di)
+                for k in 0..<Di {
+                    let es = Double(Quantization.bf16ToFloat(
+                        esRaw.load(fromByteOffset: k * 2, as: UInt16.self)))
+                    xv[k] = Self.float16ToDouble(xRaw.load(fromByteOffset: k * 2, as: UInt16.self)) * es
+                }
+                let rwRaw = routerW.buffer.contents().advanced(by: Int(routerW.offset))
+                let rwS = routerW.buffer.contents().advanced(by: Int(routerW.scaleOffset))
+                let rwB = routerW.buffer.contents().advanced(by: Int(routerW.biasOffset))
+                var logits = [Double](repeating: 0, count: cfg.numExperts)
+                for e in 0..<cfg.numExperts {
+                    var acc = 0.0
+                    let rowBase = e * (Di / 2)
+                    for g in 0..<groups {
+                        let scale = Double(Quantization.bf16ToFloat(
+                            rwS.load(fromByteOffset: (e * groups + g) * 2, as: UInt16.self)))
+                        let bias = Double(Quantization.bf16ToFloat(
+                            rwB.load(fromByteOffset: (e * groups + g) * 2, as: UInt16.self)))
+                        var dot = 0.0
+                        var sumx = 0.0
+                        for j in 0..<64 {
+                            let col = g * 64 + j
+                            let wbyte = rwRaw.load(fromByteOffset: rowBase + g * 32 + j / 2,
+                                                   as: UInt8.self)
+                            let nib = (j % 2 == 0) ? Double(wbyte & 0x0F)
+                                                   : Double((wbyte >> 4) & 0x0F)
+                            dot += nib * xv[col]
+                            sumx += xv[col]
+                        }
+                        acc += scale * dot + bias * sumx
+                    }
+                    logits[e] = acc
+                }
+                // CPU top-8 (desc by logit, ties → lower index) — matches the
+                // kernel's `s == top_score[i] && e < top_idx[i]` tie-break.
+                let top8 = (0..<cfg.numExperts).sorted { a, b in
+                    if logits[a] != logits[b] { return logits[a] > logits[b] }
+                    return a < b
+                }.prefix(8)
+                let lmax = logits[top8[0]]
+                let esum = top8.reduce(0.0) { $0 + exp(logits[$1] - lmax) }
+                var cpuIdx = [Int]()
+                var cpuW = [Double]()
+                for e in top8 {
+                    cpuIdx.append(e)
+                    let pes = Double(Quantization.bf16ToFloat(
+                        pesRaw.load(fromByteOffset: e * 2, as: UInt16.self)))
+                    cpuW.append(exp(logits[e] - lmax) / esum * pes)
+                }
+                let lmean = logits.reduce(0, +) / Double(logits.count)
+                let lstd = (logits.reduce(0.0) { $0 + ($1 - lmean) * ($1 - lmean) }
+                            / Double(logits.count)).squareRoot()
+                let lmin = logits.min()!
+                let lmx = logits.max()!
+                var kIdx = [Int]()
+                var kW = [Double]()
+                for i in 0..<8 {
+                    kIdx.append(Int(idxRaw.load(fromByteOffset: i * 4, as: UInt32.self)))
+                    kW.append(Self.float16ToDouble(wRaw.load(fromByteOffset: i * 2, as: UInt16.self)))
+                }
+                let idxMatch = (0..<8).allSatisfy { cpuIdx[$0] == kIdx[$0] }
+                let wMatch = (0..<8).allSatisfy {
+                    abs(cpuW[$0] - kW[$0]) <= max(1e-3, 0.02 * kW[$0])
+                }
+                print("[ROUTERLOGIT-\(position)-L\(L)] logitMax=\(String(format: "%.4f", lmx)) "
+                      + "logitMin=\(String(format: "%.4f", lmin)) logitStd=\(String(format: "%.4f", lstd)) "
+                      + "top8L=\(top8.map { String(format: "%.3f", logits[$0]) }.joined(separator: ","))")
+                print("[ROUTERLOGIT-\(position)-L\(L)] cpuIdx=[\(cpuIdx.joined(separator: ","))] "
+                      + "cpuW=\(cpuW.map { String(format: "%.4f", $0) }.joined(separator: ","))")
+                print("[ROUTERLOGIT-\(position)-L\(L)] kernIdx=[\(kIdx.joined(separator: ","))] "
+                      + "kernW=\(kW.map { String(format: "%.4f", $0) }.joined(separator: ","))")
+                print("[ROUTERLOGIT-\(position)-L\(L)] match=\(idxMatch && wMatch ? "YES" : "NO") "
+                      + "idx=\(idxMatch ? "YES" : "NO") w=\(wMatch ? "YES" : "NO")")
             }
             continue
         }
@@ -2343,6 +2430,26 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                    b: bW, bOut: gdnB,
                                    hiddenSize: cfg.hiddenSize)
 
+        if debugRmsDump {
+             // Snapshot the conv tail BEFORE this step consumes/shifts it, so the
+             // CPU conv reference (convtest) can replay the same inputs the
+             // gdn_conv_mix_decode kernel saw. Queued before `cb` (not yet
+             // committed), so it runs first — mirrors the state snapshot above.
+            let tailBytes = max(0, la.convKernelSize - 1) * la.qkvDim
+                           * MemoryLayout<Float16>.stride
+            if debugTailBefore == nil {
+                debugTailBefore = ctx.device.makeBuffer(
+                    length: tailBytes, options: .storageModeShared)
+             }
+            if let dst = debugTailBefore,
+               let blitCB = ctx.queue.makeCommandBuffer(),
+               let blit = blitCB.makeBlitCommandEncoder() {
+                blit.copy(from: gdnState.convTailBuffer(layer: L), sourceOffset: 0,
+                          to: dst, destinationOffset: 0, size: tailBytes)
+                blit.endEncoding()
+                blitCB.commit()
+             }
+         }
         gdn.encodeConvDecode(commandBuffer: cb,
                              tail: gdnState.convTailBuffer(layer: L),
                              qkv: gdnQKVRaw,
@@ -2805,6 +2912,159 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                           + "zRecomputed=\(String(format: "%.4f", zrec)) match=\(ok ? "YES" : "NO")")
                 }
             }
+
+            // Same test for the qkv projection, row i (v[h][dv] lives at
+            // convOut[2*Hk*Dk + i] pre-conv). If the in_proj_qkv GEMV is
+            // producing a wrong v, the y spike (which comes from state·q /
+            // the delta update with this v) is explained at the source.
+            if let qkvView = try? model.linearInProjQKV(layer: layer),
+               let qkvRaw = gdnQKVRaw {
+                let D = cfg.hiddenSize
+                let groups = D / 64
+                let Hk = la.numKHeads
+                let Dk = la.keyHeadDim
+                let normRaw = normed.contents()
+                func nx(_ j: Int) -> Double {
+                    Self.float16ToDouble(normRaw.load(fromByteOffset: j * 2, as: UInt16.self))
+                }
+                let wRaw = qkvView.buffer.contents().advanced(by: Int(qkvView.offset))
+                let sRaw = qkvView.buffer.contents().advanced(by: Int(qkvView.scaleOffset))
+                let bRaw = qkvView.buffer.contents().advanced(by: Int(qkvView.biasOffset))
+                for e in topOut {
+                    let row = 2 * Hk * Dk + e.idx
+                    var vrec = 0.0
+                    for g in 0..<groups {
+                        let scale = Double(Quantization.bf16ToFloat(
+                            sRaw.load(fromByteOffset: (row * groups + g) * 2, as: UInt16.self)))
+                        let bias = Double(Quantization.bf16ToFloat(
+                            bRaw.load(fromByteOffset: (row * groups + g) * 2, as: UInt16.self)))
+                        var dot = 0.0
+                        var sumx = 0.0
+                        for j in 0..<64 {
+                            let col = g * 64 + j
+                            let wbyte = wRaw.load(fromByteOffset: row * (D / 2) + col / 2,
+                                                  as: UInt8.self)
+                            let nib = (j % 2 == 0) ? Double(wbyte & 0x0F)
+                                                   : Double((wbyte >> 4) & 0x0F)
+                            let x = nx(col)
+                            dot += nib * x
+                            sumx += x
+                        }
+                        vrec += scale * dot + bias * sumx
+                    }
+                    let vk = Self.float16ToDouble(qkvRaw.contents().load(
+                        fromByteOffset: row * 2, as: UInt16.self))
+                    let ok = abs(vrec - vk) <= max(1e-3, 0.02 * abs(vrec))
+                    print("[GDN-\(label)-L\(layer)] vtest row\(row) vKernel=\(String(format: "%.4f", vk)) "
+                          + "vRecomputed=\(String(format: "%.4f", vrec)) match=\(ok ? "YES" : "NO")")
+                }
+            }
+
+                  // convtest: replay gdn_conv_mix_decode + gdn_qk_norm in the CPU
+                  // and compare to the kernel's gdnConvOut.
+                  // gdn_conv_mix_decode:171 applies silu to ALL channels (q/k/v),
+                  // so gdnConvOut holds silu(conv_acc) everywhere; gdn_qk_norm
+                  // then norms only the q and k slices (v passes through).
+                  //   v slice [2*Hk*Dk, qkvDim):            convOut[c] = silu(conv_acc[c])
+                  //   q slice [0, Hk*Dk):                   convOut[q] = silu(conv_acc) * invRms * (1/Dk)
+                  //   k slice [Hk*Dk, 2*Hk*Dk):            convOut[k] = silu(conv_acc) * invRms * rsqrt(Dk)
+                  //   conv_acc[c] = qkvRaw[c]*convW[c,K-1] + sum_{j=0..K-2} tail[j*C+c]*convW[c,j]
+                  //   invRms = rsqrt(mean( silu(conv_acc)^2 ) + eps), over the Dk of that head.
+                  //       (per gdn_conv_mix_decode:153-179, gdn_qk_norm:276-320).
+                  //   tail is the pre-step snapshot in debugTailBefore;
+                  //   convW is BF16 [qkvDim, K] (K = convKernelSize).
+            if let convView = try? model.linearConv1d(layer: layer),
+               let convOut = gdnConvOut,
+               let tailSnap = debugTailBefore,
+               let qkvRaw = gdnQKVRaw {
+              let C = la.qkvDim
+              let K = la.convKernelSize
+              let Dk = la.keyHeadDim
+              let Hk = la.numKHeads
+              let rmsEps: Double = 1e-6
+              func convWv(_ c: Int, _ j: Int) -> Double {
+                Double(Quantization.bf16ToFloat(
+                  convView.buffer.contents().advanced(by: Int(convView.offset))
+                          .load(fromByteOffset: (c * K + j) * 2, as: UInt16.self)))
+              }
+              func qkvRawV(_ c: Int) -> Double {
+                Self.float16ToDouble(qkvRaw.contents().load(
+                  fromByteOffset: c * 2, as: UInt16.self))
+              }
+              func tailV(_ j: Int, _ c: Int) -> Double {
+                Self.float16ToDouble(tailSnap.contents().load(
+                  fromByteOffset: (j * C + c) * 2, as: UInt16.self))
+              }
+                // conv_acc per gdn_conv_mix_decode:167-170
+              func convAcc(_ c: Int) -> Double {
+                var acc = qkvRawV(c) * convWv(c, K - 1)
+                for j in 0..<(K - 1) {
+                  acc += tailV(j, c) * convWv(c, j)
+                }
+                return acc
+              }
+                // gdn_conv_mix_decode:171 applies silu to every channel output
+              func convOutRec(_ c: Int) -> Double {
+                Self.siluDouble(convAcc(c))
+              }
+              func convOutK(_ c: Int) -> Double {
+                Self.float16ToDouble(convOut.contents().load(
+                  fromByteOffset: c * 2, as: UInt16.self))
+              }
+                // 1) v slice: topOut idx are v-slice elements; compare
+                //    silu(conv_acc) to the kernel's gdnConvOut.
+              for e in topOut {
+                let c = 2 * Hk * Dk + e.idx
+                let rec = convOutRec(c)
+                let kv = convOutK(c)
+                let ok = abs(rec - kv) <= max(1e-3, 0.02 * abs(rec))
+                print("[GDN-\(label)-L\(layer)] convtest-v c\(c) convK=\(String(format: "%.4f", kv)) "
+                      + "convR=\(String(format: "%.4f", rec)) match=\(ok ? "YES" : "NO")")
+              }
+                // 2) q slice: head 0, first Dk channels.
+                //    qk_norm: x*invRms*(1/Dk), where x = silu(conv_acc) and
+                //    invRms = rsqrt(mean(x^2)+eps) over those Dk channels.
+              do {
+                let base = 0
+                var sumSq = 0.0
+                for i in 0..<Dk {
+                  let x = convOutRec(base + i)
+                  sumSq += x * x
+                }
+                let invRms = 1.0 / sqrt(sumSq / Double(Dk) + rmsEps)
+                var maxErr = 0.0
+                for i in 0..<Dk {
+                  let rec = convOutRec(base + i) * invRms * (1.0 / Double(Dk))
+                  let kv = convOutK(base + i)
+                  let er = abs(rec - kv)
+                  if er > maxErr { maxErr = er }
+                }
+                let ok = maxErr <= max(1e-3, 0.02)
+                print("[GDN-\(label)-L\(layer)] convtest-q h0 Dk\(Dk) maxErr=\(String(format: "%.4f", maxErr)) "
+                      + "match=\(ok ? "YES" : "NO")")
+              }
+                // 3) k slice: head 0, channels [Hk*Dk, 2*Hk*Dk).
+                //    qk_norm: x*invRms*rsqrt(Dk), x = silu(conv_acc).
+              do {
+                let base = Hk * Dk
+                var sumSq = 0.0
+                for i in 0..<Dk {
+                  let x = convOutRec(base + i)
+                  sumSq += x * x
+                }
+                let invRms = 1.0 / sqrt(sumSq / Double(Dk) + rmsEps)
+                var maxErr = 0.0
+                for i in 0..<Dk {
+                  let rec = convOutRec(base + i) * invRms * (1.0 / sqrt(Double(Dk)))
+                  let kv = convOutK(base + i)
+                  let er = abs(rec - kv)
+                  if er > maxErr { maxErr = er }
+                }
+                let ok = maxErr <= max(1e-3, 0.02)
+                print("[GDN-\(label)-L\(layer)] convtest-k h0 Dk\(Dk) maxErr=\(String(format: "%.4f", maxErr)) "
+                      + "match=\(ok ? "YES" : "NO")")
+              }
+             }
         }
 
         guard includeShared, let gdnConvOut, let gdnY, let gdnA, let gdnB,
