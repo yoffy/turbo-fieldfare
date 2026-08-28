@@ -2339,9 +2339,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 print("[ROUTERLOGIT-\(position)-L\(L)] logitMax=\(String(format: "%.4f", lmx)) "
                       + "logitMin=\(String(format: "%.4f", lmin)) logitStd=\(String(format: "%.4f", lstd)) "
                       + "top8L=\(top8.map { String(format: "%.3f", logits[$0]) }.joined(separator: ","))")
-                print("[ROUTERLOGIT-\(position)-L\(L)] cpuIdx=[\(cpuIdx.joined(separator: ","))] "
+                print("[ROUTERLOGIT-\(position)-L\(L)] cpuIdx=[\(cpuIdx.map { String($0) }.joined(separator: ","))] "
                       + "cpuW=\(cpuW.map { String(format: "%.4f", $0) }.joined(separator: ","))")
-                print("[ROUTERLOGIT-\(position)-L\(L)] kernIdx=[\(kIdx.joined(separator: ","))] "
+                print("[ROUTERLOGIT-\(position)-L\(L)] kernIdx=[\(kIdx.map { String($0) }.joined(separator: ","))] "
                       + "kernW=\(kW.map { String(format: "%.4f", $0) }.joined(separator: ","))")
                 print("[ROUTERLOGIT-\(position)-L\(L)] match=\(idxMatch && wMatch ? "YES" : "NO") "
                       + "idx=\(idxMatch ? "YES" : "NO") w=\(wMatch ? "YES" : "NO")")
