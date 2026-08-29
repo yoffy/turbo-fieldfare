@@ -2912,6 +2912,65 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                           + "zRecomputed=\(String(format: "%.4f", zrec)) match=\(ok ? "YES" : "NO")")
                 }
             }
+            // wtest: in_proj_z weight row-magnitude distribution.
+            // ztest only proves the GEMV is computed correctly for the GIVEN
+            // weights; it cannot tell whether W_z's rows are themselves sane.
+            // At L1 the input (hidden_in, normed rms=1 by RMSNorm) is small and
+            // position-independent, so a large z (6.89 vs 35B 0.027) must
+            // reflect W_z row magnitude. Measure the per-row RMS distribution
+            // and check whether the spike rows (topOut dims) are outliers
+            // within this model's own distribution.
+            // Dequant rule matches ztest exactly: w = scale * nib + bias,
+            // nib = raw 0..15 (zero-point absorbed into scale/bias).
+            // Gated to L0 (healthy baseline) + L1 (blow-up): the weights are
+            // model parameters (position-invariant), so the distribution needs
+            // to be computed only once per layer; the full per-layer sweep over
+            // all 36 GDN layers x 3 positions would cost ~10-15s for no signal.
+            if layer <= 1, let zView = try? model.linearInProjZ(layer: layer) {
+                let D = cfg.hiddenSize
+                let N = Hv * dv
+                let groups = D / 64
+                let wRaw = zView.buffer.contents().advanced(by: Int(zView.offset))
+                let sRaw = zView.buffer.contents().advanced(by: Int(zView.scaleOffset))
+                let bRaw = zView.buffer.contents().advanced(by: Int(zView.biasOffset))
+                var rowRms = [Double](repeating: 0, count: N)
+                for i in 0..<N {
+                    var sumSq = 0.0
+                    for g in 0..<groups {
+                        let scale = Double(Quantization.bf16ToFloat(
+                            sRaw.load(fromByteOffset: (i * groups + g) * 2, as: UInt16.self)))
+                        let bias = Double(Quantization.bf16ToFloat(
+                            bRaw.load(fromByteOffset: (i * groups + g) * 2, as: UInt16.self)))
+                        for j in 0..<64 {
+                            let col = g * 64 + j
+                            let wbyte = wRaw.load(fromByteOffset: i * (D / 2) + col / 2,
+                                                  as: UInt8.self)
+                            let nib = (j % 2 == 0) ? Double(wbyte & 0x0F)
+                                                   : Double((wbyte >> 4) & 0x0F)
+                            let w = scale * nib + bias
+                            sumSq += w * w
+                        }
+                    }
+                    rowRms[i] = (sumSq / Double(D)).squareRoot()
+                }
+                let sorted = rowRms.sorted()
+                let med = sorted[N / 2]
+                let p99 = sorted[Int(Double(N - 1) * 0.99)]
+                let mx = sorted[N - 1]
+                let mean = rowRms.reduce(0, +) / Double(N)
+                var desc = [String]()
+                for e in topOut {
+                    let r = rowRms[e.idx]
+                    let ratio = (med > 0) ? r / med : 0
+                    desc.append("i\(e.idx) rowRMS=\(String(format: "%.4f", r)) "
+                        + "medRatio=\(String(format: "%.2f", ratio)) "
+                        + "outlier=\(ratio > 3 ? "YES" : "NO")")
+                }
+                print("[GDN-\(label)-L\(layer)] wtest-z N\(N) mean=\(String(format: "%.4f", mean)) "
+                      + "med=\(String(format: "%.4f", med)) p99=\(String(format: "%.4f", p99)) "
+                      + "max=\(String(format: "%.4f", mx)) "
+                      + desc.joined(separator: " "))
+            }
 
             // Same test for the qkv projection, row i (v[h][dv] lives at
             // convOut[2*Hk*Dk + i] pre-conv). If the in_proj_qkv GEMV is
