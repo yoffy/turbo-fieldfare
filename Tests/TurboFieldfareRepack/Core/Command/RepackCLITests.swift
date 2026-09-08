@@ -53,6 +53,32 @@ struct RepackCLITests {
         #expect(result.stderr.contains("qwen36"))
     }
 
+    @Test func sourceDirCannotCombineWithModel() throws {
+        let output = temporaryOutput("local-model")
+        defer { clean(output) }
+        let result = try run([
+            "--source-dir", "/tmp/does-not-matter",
+            "--model", "qwen36",
+            "--output", output,
+        ])
+
+        #expect(result.status == 2)
+        #expect(result.stderr.contains("--source-dir cannot be combined with --model"))
+    }
+
+    @Test func sourceDirDoesNotSupportResume() throws {
+        let output = temporaryOutput("local-resume")
+        defer { clean(output) }
+        let result = try run([
+            "--source-dir", "/tmp/does-not-matter",
+            "--output", output,
+            "--resume",
+        ])
+
+        #expect(result.status == 2)
+        #expect(result.stderr.contains("--source-dir does not support --resume"))
+    }
+
     @Test func qwenModelSelectorIsAccepted() throws {
         let output = temporaryOutput("qwen-model")
         defer { clean(output) }

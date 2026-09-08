@@ -4,6 +4,7 @@ import TurboFieldfareRepackCore
 private let usage = """
 Usage:
   TurboFieldfareRepack [--model <gemma4|qwen36>] --output <model.gturbo> [--overwrite] [--resume]
+  TurboFieldfareRepack --source-dir <snapshot-dir> --output <model.gturbo> [--overwrite]
   TurboFieldfareRepack --discard-partial --output <model.gturbo>
   TurboFieldfareRepack --verify-install --input-gturbo <model.gturbo>
   TurboFieldfareRepack --help
@@ -13,10 +14,18 @@ checkpoint) from Hugging Face and repackages it without materializing the
 source checkpoint on disk. Set HF_TOKEN only if Hugging Face requests
 authentication. A cancelled or interrupted download can be continued with
 --resume or removed with --discard-partial.
+
+Alternatively, --source-dir repacks a checkpoint already on local disk
+(containing model.safetensors.index.json, config.json, and the shard files)
+without any network access. The tensor payload layout is identical to the
+streaming installer, so the same source snapshot yields byte-identical
+model_weights.bin / packed_experts outputs.
 """
 
 private struct Arguments {
     var model = SupportedModelSource.default
+    var modelExplicit = false
+    var sourceDir: String?
     var output: String?
     var overwrite = false
     var resume = false
@@ -54,6 +63,13 @@ private struct Arguments {
                         + SupportedModelSource.all.map(\.name).joined(separator: ", "))
                 }
                 parsed.model = source
+                parsed.modelExplicit = true
+                index += 2
+            case "--source-dir":
+                guard index + 1 < values.count else {
+                    throw ParseError.missingValue(flag)
+                }
+                parsed.sourceDir = values[index + 1]
                 index += 2
             case "--output", "--input-gturbo":
                 guard index + 1 < values.count else {
@@ -77,7 +93,8 @@ private struct Arguments {
             guard parsed.output != nil else {
                 throw ParseError.missingRequired("--output")
             }
-            guard parsed.inputGTurbo == nil, !parsed.overwrite, !parsed.verifyInstall else {
+            guard parsed.inputGTurbo == nil, !parsed.overwrite, !parsed.verifyInstall,
+                  parsed.sourceDir == nil else {
                 throw ParseError.invalidMode("--discard-partial only accepts --output")
             }
             return parsed
@@ -89,12 +106,23 @@ private struct Arguments {
             guard parsed.output == nil, !parsed.overwrite, !parsed.resume else {
                 throw ParseError.invalidMode("verification accepts only --input-gturbo")
             }
+            guard parsed.sourceDir == nil else {
+                throw ParseError.invalidMode("--source-dir cannot be combined with --verify-install")
+            }
         } else {
             guard parsed.output != nil else {
                 throw ParseError.missingRequired("--output")
             }
             guard parsed.inputGTurbo == nil else {
                 throw ParseError.invalidMode("--input-gturbo requires --verify-install")
+            }
+            if parsed.sourceDir != nil {
+                guard !parsed.modelExplicit else {
+                    throw ParseError.invalidMode("--source-dir cannot be combined with --model")
+                }
+                guard !parsed.resume else {
+                    throw ParseError.invalidMode("--source-dir does not support --resume")
+                }
             }
         }
         return parsed
@@ -160,6 +188,22 @@ private func run(_ values: [String]) async -> Int32 {
     }
 
     guard let output = arguments.output else { return 2 }
+    if let sourceDir = arguments.sourceDir {
+        let options = LocalStreamingRepackOptions(
+            sourceDir: sourceDir,
+            outputDir: output,
+            overwrite: arguments.overwrite)
+        do {
+            let result = try await LocalStreamingRepacker(options: options).run()
+            print("Installed local snapshot (\(result.modelID ?? "unknown/snapshot"))")
+            print("Source index SHA-256: \(result.sourceIndexSHA256)")
+            print("Model: \(result.outputDir)")
+            return 0
+        } catch {
+            printError("install failed: \(error)")
+            return 1
+        }
+    }
     let source = arguments.model
     let options = source.installOptions(
         outputDirectory: URL(fileURLWithPath: output),
