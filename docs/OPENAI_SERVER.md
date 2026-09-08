@@ -1,7 +1,9 @@
 # Local OpenAI-compatible server
 
 `TurboFieldfareServer` exposes a local Chat Completions API for one Gemma
-model. It binds to `127.0.0.1` without authentication or TLS. Do not expose it
+model. By default it binds to `127.0.0.1` without authentication or TLS.
+`--host` can change the bind address, but a non-loopback address exposes the
+server to the network without authentication or TLS. Do not expose it
 through a proxy or tunnel.
 
 ## Start the server
@@ -43,7 +45,8 @@ curl --silent --show-error http://127.0.0.1:8080/v1/chat/completions \
 ```
 
 By default, the server runs one generation and queues up to four requests. Use
-`--queue-limit` to change the queue size. Press Control-C to stop the server.
+`--queue-limit` to change the queue size. Use `--host` to change the bind
+address (default `127.0.0.1`). Press Control-C to stop the server.
 
 ## Connect a client
 

@@ -2,6 +2,14 @@ import Darwin
 import Foundation
 import TurboFieldfareServerCore
 
+private func isLoopbackHost(_ host: String) -> Bool {
+    let normalized = host.lowercased()
+    return normalized == "localhost"
+        || normalized == "127.0.0.1"
+        || normalized == "::1"
+        || normalized.hasPrefix("127.")
+}
+
 let arguments: ServerArguments
 do {
     arguments = try ServerArguments.parse(Array(CommandLine.arguments.dropFirst()))
@@ -26,8 +34,11 @@ do {
         queueLimit: arguments.queueLimit,
         backend: backend,
         chatDialect: backend.chatDialect)
-    _ = try await server.start(port: arguments.port)
-    print("TurboFieldfareServer ready at http://127.0.0.1:\(arguments.port) model=\(modelID) context=\(arguments.maxContext) prompt_cache=\(arguments.promptCacheMode.rawValue)")
+    _ = try await server.start(port: arguments.port, host: arguments.host)
+    print("TurboFieldfareServer ready at http://\(arguments.host):\(arguments.port) model=\(modelID) context=\(arguments.maxContext) prompt_cache=\(arguments.promptCacheMode.rawValue)")
+    if !isLoopbackHost(arguments.host) {
+        FileHandle.standardError.write(Data("warning: binding to non-loopback address '\(arguments.host)' exposes the server without authentication or TLS\n".utf8))
+    }
 
     _ = await signals.wait()
     try await server.shutdown()

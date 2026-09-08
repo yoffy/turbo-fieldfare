@@ -2,6 +2,7 @@ import Foundation
 
 public struct ServerArguments: Equatable, Sendable {
     public let model: String
+    public let host: String
     public let port: Int
     /// Explicit --model-id value; nil defers to the loaded model's family
     /// default (gemma-4-26b-a4b-it or qwen3.6-35b-a3b).
@@ -15,7 +16,10 @@ public struct ServerArguments: Equatable, Sendable {
     usage: TurboFieldfareServer --model <completed .gturbo directory> [options]
 
       --model <dir>          Required model directory.
-      --port <1...65535>     Loopback port (default 8080).
+      --host <address>       Bind address (default 127.0.0.1). A non-loopback
+                             address exposes the server without authentication
+                             or TLS.
+      --port <1...65535>     TCP port (default 8080).
       --model-id <id>        API model identifier (default derived from the
                              installed model: gemma-4-26b-a4b-it or
                              qwen3.6-35b-a3b).
@@ -28,6 +32,7 @@ public struct ServerArguments: Equatable, Sendable {
 
     public static func parse(_ input: [String]) throws -> ServerArguments {
         var model: String?
+        var host = "127.0.0.1"
         var port = 8080
         var modelIDOverride: String?
         var maxContext = 16_384
@@ -45,6 +50,11 @@ public struct ServerArguments: Equatable, Sendable {
             switch flag {
             case "--model":
                 model = value
+            case "--host":
+                guard !value.isEmpty else {
+                    throw ServerArgumentError.invalid("--host must not be empty")
+                }
+                host = value
             case "--port":
                 guard let parsed = Int(value), (1...65_535).contains(parsed) else {
                     throw ServerArgumentError.invalid("--port must be between 1 and 65535")
@@ -77,6 +87,7 @@ public struct ServerArguments: Equatable, Sendable {
         }
         guard let model else { throw ServerArgumentError.invalid("--model is required") }
         return ServerArguments(model: model,
+                               host: host,
                                port: port,
                                modelIDOverride: modelIDOverride,
                                maxContext: maxContext,
