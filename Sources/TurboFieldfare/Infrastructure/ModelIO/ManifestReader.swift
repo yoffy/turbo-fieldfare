@@ -183,7 +183,8 @@ public enum ManifestReader {
         let slots: [(String, ManifestQuantSlot, Set<Int>)] = [
             ("embedding", quant.embedding, [4]),
             ("attention", quant.attention, [4]),
-            ("router", quant.router, [8]),
+            // Qwen 3.6 ships an 8-bit router; Qwen 3.5 ships a 4-bit router.
+            ("router", quant.router, [4, 8]),
             ("sharedExpert", quant.sharedExpert, [4, 8]),
             ("routedExpert", quant.routedExpert, [4]),
         ]

@@ -38,6 +38,8 @@ final class MoE {
 
     private let routerGemvPSO: MTLComputePipelineState
     private let routerGemvSpecializedPSO: MTLComputePipelineState
+    private let routerGemvInt4PSO: MTLComputePipelineState
+    private let routerGemvInt4SpecializedPSO: MTLComputePipelineState
     private let routerSelectK8PSO: MTLComputePipelineState
     private let routerSelectK8SpecializedPSO: MTLComputePipelineState
     private let routerLogits: MTLBuffer
@@ -84,6 +86,16 @@ final class MoE {
             maxTotalThreadsPerThreadgroup: 512)
         self.routerGemvSpecializedPSO = try context.pipeline(
             routerName,
+            constants: routerConstants,
+            maxTotalThreadsPerThreadgroup: 512)
+        // Qwen 3.5's 4-bit router: same bindings and top-k tail, nibble-packed
+        // weights (see `router_gemv_int4` in moe.metal).
+        self.routerGemvInt4PSO = try context.pipeline(
+            "router_gemv_int4",
+            constants: [],
+            maxTotalThreadsPerThreadgroup: 512)
+        self.routerGemvInt4SpecializedPSO = try context.pipeline(
+            "router_gemv_int4",
             constants: routerConstants,
             maxTotalThreadsPerThreadgroup: 512)
         self.routerSelectK8PSO = try context.pipeline("router_topk_select_k8")
@@ -133,18 +145,23 @@ final class MoE {
                                    outWeights: MTLBuffer,
                                    numExperts: UInt32,
                                    d: UInt32,
-                                   topK: UInt32) {
+                                   topK: UInt32,
+                                   weightBits: Int = 8) {
         precondition(d.isMultiple(of: UInt32(Quantization.groupSize)))
         precondition(numExperts <= 256)
         precondition(topK == UInt32(Self.maxStreamedExperts))
+        precondition(weightBits == 8 || weightBits == 4,
+                     "router weight bits must be 8 or 4")
 
         var expertCount = numExperts
         var dimension = d
         let useSpecialized = numExperts == realDecodeNumExperts
             && d == realDecodeD
+        let gemvPSO = weightBits == 4
+            ? (useSpecialized ? routerGemvInt4SpecializedPSO : routerGemvInt4PSO)
+            : (useSpecialized ? routerGemvSpecializedPSO : routerGemvPSO)
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.setComputePipelineState(
-                useSpecialized ? routerGemvSpecializedPSO : routerGemvPSO)
+            encoder.setComputePipelineState(gemvPSO)
             encoder.setBuffer(weights, offset: weightsOffset, index: 0)
             encoder.setBuffer(scales, offset: scalesOffset, index: 1)
             encoder.setBuffer(biases, offset: biasesOffset, index: 2)

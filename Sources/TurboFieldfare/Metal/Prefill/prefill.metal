@@ -582,6 +582,112 @@ kernel void prefill_router_gemma4_block(
     }
 }
 
+// INT4 router block for Qwen 3.5 (`mlp.gate`, 4-bit affine group=64).
+// Identical framing to `prefill_router_gemma4_block` (one threadgroup per
+// token row, fused top-k + renormalized softmax weights), but each weight
+// row packs two params per byte (low nibble first). The inner loop walks
+// the 32 bytes of each 64-element group.
+kernel void prefill_router_int4_block(
+    device const uint8_t* W                [[buffer(0)]],
+    device const bfloat*  scales           [[buffer(1)]],
+    device const bfloat*  biases           [[buffer(2)]],
+    device const half*    hidden           [[buffer(3)]],
+    device const bfloat*  effective_scale  [[buffer(4)]],
+    device const bfloat*  per_expert_scale [[buffer(5)]],
+    device uint*          out_indices      [[buffer(6)]],
+    device half*          out_weights      [[buffer(7)]],
+    constant uint&        T                [[buffer(8)]],
+    constant uint&        num_experts      [[buffer(9)]],
+    constant uint&        D                [[buffer(10)]],
+    constant uint&        top_k            [[buffer(11)]],
+    constant uint&        hidden_stride    [[buffer(12)]],
+    uint                  row              [[threadgroup_position_in_grid]],
+    uint                  tid              [[thread_position_in_threadgroup]],
+    uint                  tg_size          [[threads_per_threadgroup]]
+) {
+    if (row >= T) return;
+    threadgroup float scores[kPrefillRouterMaxExperts];
+    const uint NE = min(num_experts, kPrefillRouterMaxExperts);
+    const uint KK = min(top_k, kPrefillRouterMaxTopK);
+    device const half* row_hidden = hidden + row * hidden_stride;
+
+    for (uint e = tid; e < NE; e += tg_size) {
+        const uint n_groups = D / kPrefillGroupSize;
+        device const uint8_t* W_row = W + e * (D / 2u);
+        device const bfloat* s_row = scales + e * n_groups;
+        device const bfloat* b_row = biases + e * n_groups;
+
+        float acc = 0.0f;
+        for (uint g = 0; g < n_groups; ++g) {
+            float s = float(s_row[g]);
+            float b = float(b_row[g]);
+            device const uint8_t* Wg = W_row + g * (kPrefillGroupSize / 2u);
+            device const half* xg = row_hidden + g * kPrefillGroupSize;
+            device const bfloat* eg = effective_scale + g * kPrefillGroupSize;
+            float dot_qx = 0.0f;
+            float sum_x = 0.0f;
+            for (uint k = 0; k < kPrefillGroupSize / 2u; ++k) {
+                uint8_t byte = Wg[k];
+                float q0 = float(uint(byte & 0x0Fu));
+                float q1 = float(uint(byte >> 4));
+                float x0 = float(xg[2u * k]) * float(eg[2u * k]);
+                float x1 = float(xg[2u * k + 1u]) * float(eg[2u * k + 1u]);
+                dot_qx = fma(q0, x0, dot_qx);
+                dot_qx = fma(q1, x1, dot_qx);
+                sum_x += x0 + x1;
+            }
+            acc = fma(s, dot_qx, acc);
+            acc = fma(b, sum_x, acc);
+        }
+        scores[e] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        uint top_idx[kPrefillRouterMaxTopK];
+        float top_score[kPrefillRouterMaxTopK];
+        for (uint i = 0; i < kPrefillRouterMaxTopK; ++i) {
+            top_idx[i] = 0u;
+            top_score[i] = -INFINITY;
+        }
+
+        for (uint e = 0; e < NE; ++e) {
+            float s = scores[e];
+            if (KK > 0 && s <= top_score[KK - 1]) continue;
+            uint pos = KK;
+            for (uint i = 0; i < KK; ++i) {
+                if (s > top_score[i] || (s == top_score[i] && e < top_idx[i])) {
+                    pos = i;
+                    break;
+                }
+            }
+            if (pos >= KK) continue;
+            for (uint i = KK - 1; i > pos; --i) {
+                top_idx[i] = top_idx[i - 1];
+                top_score[i] = top_score[i - 1];
+            }
+            top_idx[pos] = e;
+            top_score[pos] = s;
+        }
+
+        float max_s = top_score[0];
+        float sum_exp = 0.0f;
+        float exps[kPrefillRouterMaxTopK];
+        for (uint i = 0; i < KK; ++i) {
+            float e = fast::exp(top_score[i] - max_s);
+            exps[i] = e;
+            sum_exp += e;
+        }
+        for (uint i = 0; i < KK; ++i) {
+            const uint expert_idx = top_idx[i];
+            const float w = exps[i] / sum_exp;
+            const float gain = float(per_expert_scale[expert_idx]);
+            out_indices[row * top_k + i] = expert_idx;
+            out_weights[row * top_k + i] = half(w * gain);
+        }
+    }
+}
+
 kernel void prefill_moe_reduce_token_major(
     device const half* route_partials [[buffer(0)]],
     device const half* route_weights  [[buffer(1)]],

@@ -143,6 +143,70 @@ kernel void router_gemv_gemma4_r4(
                             out_logits, num_experts, D, 4, tg_idx, sg_idx, lane);
 }
 
+// INT4 router GEMV for Qwen 3.5 (`mlp.gate`, 4-bit affine group=64).
+// Same data flow as the INT8 body above, but each weight row packs two
+// params per byte: low nibble = element 2k, high nibble = element 2k+1
+// (the repacker's INT4 layout). One lane handles one byte (two elements)
+// per group, so 32 lanes cover the 64-element group exactly.
+static inline void router_gemv_int4_body(
+    device const uint8_t* W,
+    device const bfloat* scales,
+    device const bfloat* biases,
+    device const half* hidden,
+    device const bfloat* effective_scale,
+    device float* out_logits,
+    constant uint& num_experts,
+    constant uint& D,
+    uint rows_per_tg,
+    uint tg_idx,
+    uint sg_idx,
+    uint lane
+) {
+    const uint NE = router_fc_num_experts(num_experts);
+    const uint DD = router_fc_d(D);
+    const uint e = tg_idx * rows_per_tg + sg_idx;
+    if (e >= NE) return;
+
+    const uint n_groups = DD / kMoEGroupSize;
+    const uint row_bytes = DD / 2u;
+    device const uint8_t* W_row = W + uint(e) * row_bytes;
+    device const bfloat* s_row = scales + uint(e) * n_groups;
+    device const bfloat* b_row = biases + uint(e) * n_groups;
+
+    float acc = 0.0f;
+    for (uint g = 0; g < n_groups; ++g) {
+        const float s = float(s_row[g]);
+        const float b = float(b_row[g]);
+        const uint8_t byte = W_row[g * (kMoEGroupSize / 2u) + lane];
+        const uint idx = g * kMoEGroupSize + lane * 2u;
+        const float q0 = float(uint(byte & 0x0Fu));
+        const float q1 = float(uint(byte >> 4));
+        const float x0 = float(hidden[idx]) * float(effective_scale[idx]);
+        const float x1 = float(hidden[idx + 1u]) * float(effective_scale[idx + 1u]);
+        acc = fma(s, q0 * x0 + q1 * x1, acc);
+        acc = fma(b, x0 + x1, acc);
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) out_logits[e] = acc;
+}
+
+kernel void router_gemv_int4(
+    device const uint8_t* W [[buffer(0)]],
+    device const bfloat* scales [[buffer(1)]],
+    device const bfloat* biases [[buffer(2)]],
+    device const half* hidden [[buffer(3)]],
+    device const bfloat* effective_scale [[buffer(4)]],
+    device float* out_logits [[buffer(5)]],
+    constant uint& num_experts [[buffer(6)]],
+    constant uint& D [[buffer(7)]],
+    uint tg_idx [[threadgroup_position_in_grid]],
+    uint sg_idx [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    router_gemv_int4_body(W, scales, biases, hidden, effective_scale,
+                          out_logits, num_experts, D, 4, tg_idx, sg_idx, lane);
+}
+
 kernel void router_topk_select_k8(
     device const float* logits [[buffer(0)]],
     device const bfloat* per_expert_scale [[buffer(1)]],

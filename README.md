@@ -355,6 +355,30 @@ The Mac app selects Qwen with `TURBO_FIELDFARE_MODEL=qwen36` in the
 environment; the server auto-detects the installed model and serves it as
 `qwen3.6-35b-a3b` with the ChatML template and Qwen tool-call format.
 
+### Qwen 3.5 122B-A10B
+
+TurboFieldfare also runs
+[Qwen3.5-122B-A10B](https://huggingface.co/Qwen/Qwen3.5-122B-A10B) from the
+pinned `mlx-community/Qwen3.5-122B-A10B-4bit` checkpoint: the same hybrid
+contract at 48 layers / hidden 3072 (36 gated-DeltaNet linear-attention
+layers plus 12 gated full-attention layers), 256 routed experts (top-8) plus
+a sigmoid-gated shared expert. The router and scalar shared-expert gate are
+4-bit (Qwen 3.6 ships them 8-bit), served by dedicated INT4 router kernels.
+The text-only install is about 68.7 GB; the vision tower is omitted.
+
+```bash
+swift run -c release TurboFieldfareRepack \
+  --model qwen35 \
+  --output scratch/qwen35.gturbo \
+  --overwrite
+swift run -c release TurboFieldfareCLI \
+  --model scratch/qwen35.gturbo \
+  --messages-file messages.json
+```
+
+The Mac app selects it with `TURBO_FIELDFARE_MODEL=qwen35`; the server
+auto-detects the installed model and serves it as `qwen3.5-122b-a10b`.
+
 Measured on an M5 following the
 [community benchmark protocol](docs/COMMUNITY_BENCHMARKS.md) — the three frozen
 prompts, fixed seeds, one warmup then one measured run per case in a fresh

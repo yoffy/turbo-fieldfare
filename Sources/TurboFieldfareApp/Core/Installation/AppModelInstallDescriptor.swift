@@ -54,29 +54,43 @@ public struct AppModelInstallDescriptor: Equatable, Sendable {
         rangeStagingBytes: UInt64(RemoteChunkPolicy.defaultBytes),
         reserveBytes: 1_073_741_824)
 
+    public static let qwen35 = AppModelInstallDescriptor(
+        displayName: "Qwen3.5 122B-A10B 4-bit",
+        repoID: "mlx-community/Qwen3.5-122B-A10B-4bit",
+        revision: "e9c67b08899964be5fdd069bb1b4bc8907fe68f5",
+        sourceIndexSHA256: "e6bbd20503bb8f43b7df32983a5711e7fb54785807c296614801d7209ab40222",
+        approximateDownloadBytes: 68_739_047_424,
+        installedBytes: 68_739_047_424,
+        rangeStagingBytes: UInt64(RemoteChunkPolicy.defaultBytes),
+        reserveBytes: 1_073_741_824)
+
     /// The shipped descriptor for a model family, if one exists.
     public static func descriptor(for family: ModelFamily) -> AppModelInstallDescriptor? {
         switch family {
         case .gemma4: return .default
         case .qwen36: return .qwen36
+        case .qwen35: return .qwen35
         }
     }
 
     /// Basename of the installed `.gturbo` directory for this descriptor.
     public var installDirectoryName: String {
-        self == .qwen36 ? "qwen36.gturbo" : "gemma4.gturbo"
+        if self == .qwen35 { return "qwen35.gturbo" }
+        return self == .qwen36 ? "qwen36.gturbo" : "gemma4.gturbo"
     }
 
     /// The descriptor the app products select at launch. Defaults to Gemma 4.
-    /// `TURBO_FIELDFARE_MODEL=qwen36` in the environment wins; otherwise the
-    /// persisted preference (`defaults write TurboFieldfare model qwen36`)
-    /// applies, so GUI launches without an environment also select Qwen.
+    /// `TURBO_FIELDFARE_MODEL=qwen35` (or `qwen36`) in the environment wins;
+    /// otherwise the persisted preference
+    /// (`defaults write TurboFieldfare model qwen35`) applies, so GUI
+    /// launches without an environment also select the model.
     public static var selected: AppModelInstallDescriptor {
         let environmentValue = ProcessInfo.processInfo.environment["TURBO_FIELDFARE_MODEL"]
         let preferenceValue = UserDefaults(suiteName: "TurboFieldfare")?
             .string(forKey: "model")
         switch environmentValue ?? preferenceValue {
         case "qwen36": return .qwen36
+        case "qwen35": return .qwen35
         default: return .default
         }
     }

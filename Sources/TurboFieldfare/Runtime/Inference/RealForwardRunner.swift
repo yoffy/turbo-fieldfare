@@ -166,6 +166,11 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     private let gdnState: GDNStateManager?
     private let rope: RoPE?
     private let int8ScalarGate: DequantInt8GEMV?
+    /// Router (`mlp.gate`) weight bits from the manifest. 8 on Qwen 3.6, 4 on
+    /// Qwen 3.5. Selects the INT8 vs INT4 router GEMV kernels and the scalar
+    /// shared-expert gate path (the scalar gate shares the router's width in
+    /// both pinned checkpoints).
+    private let routerWeightBits: Int
 
     // Prefill kernels. These are initialized once per runner so the chunk path
     // cannot accidentally rebuild PSOs inside a per-layer loop.
@@ -275,11 +280,19 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                      maxPrefillChunkTokens: PrefillRuntimeConfig.maxChunkTokens)
 
         let silu = cfg.hiddenActivation == "silu"
+        self.routerWeightBits = model.routerWeightBits
         self.embedInt4 = try EmbedLookupInt4(context: context)
         self.rms       = try RMSNorm(context: context)
+        // A 4-bit router (Qwen 3.5) runs through the INT4 GEMV, so its
+        // shapes join the specialization set alongside the scalar gate's.
+        var int4Shapes = cfg.decodeInt4GEMVShapes
+        if model.routerWeightBits == 4 {
+            int4Shapes.append((m: cfg.numExperts, n: cfg.hiddenSize))
+            int4Shapes.append((m: 1, n: cfg.hiddenSize))
+        }
         self.int4      = try DequantInt4GEMV(
             context: context,
-            additionalShapes: cfg.decodeInt4GEMVShapes)
+            additionalShapes: int4Shapes)
         self.attention = try Attention(context: context)
         self.shared    = try SharedExpertRuntime(context: context,
                                                   weightBits: model.sharedExpertWeightBits,
@@ -331,7 +344,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             self.gdnState = nil
         }
         self.rope = cfg.ropeNeoxSubdim ? try RoPE(context: context) : nil
-        self.int8ScalarGate = cfg.sharedExpertGated
+        // The scalar shared-expert gate shares the router's quantization
+        // width (8-bit on Qwen 3.6, 4-bit on Qwen 3.5); the 4-bit gate runs
+        // through the INT4 GEMV instead.
+        self.int8ScalarGate = (cfg.sharedExpertGated && model.routerWeightBits == 8)
             ? try DequantInt8GEMV(context: context,
                                   additionalShapes: cfg.decodeInt8GEMVShapes)
             : nil
@@ -1247,7 +1263,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                         numExperts: UInt32(cfg.numExperts),
                         d: UInt32(D),
                         topK: UInt32(cfg.topKExperts),
-                        hiddenStrideElements: UInt32(D))
+                        hiddenStrideElements: UInt32(D),
+                        weightBits: routerWeightBits)
 
                     cb.commit()
                     waitForCompletion(cb)
@@ -1327,19 +1344,13 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                         let gateView = sharedProj.scalarGate!
                         let halfBytes = MemoryLayout<Float16>.stride
                         for row in 0..<t {
-                            int8ScalarGate!.encode(
-                                commandBuffer: sharedCB,
-                                weights: gateView.buffer,
-                                weightsOffset: Int(gateView.offset),
-                                scales: gateView.buffer,
-                                scalesOffset: Int(gateView.scaleOffset),
-                                biases: gateView.buffer,
-                                biasesOffset: Int(gateView.biasOffset),
-                                x: scratch.routedX,
-                                xOffset: row * D * halfBytes,
-                                y: scratch.sharedScalarGate,
-                                yOffset: row * halfBytes,
-                                m: 1, n: UInt32(D))
+                            encodeScalarGate(sharedCB,
+                                             gateView: gateView,
+                                             x: scratch.routedX,
+                                             xOffset: row * D * halfBytes,
+                                             y: scratch.sharedScalarGate,
+                                             yOffset: row * halfBytes,
+                                             d: D)
                         }
                         for row in 0..<t {
                             elementwise!.encodeSigmoidScalarMul(
@@ -1860,7 +1871,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 perExpertScale: perExpertScale.buffer,
                 perExpertScaleOffset: perExpertScale.offset,
                 outIndices: outIndices, outWeights: outWeights,
-                numExperts: UInt32(cfg.numExperts), d: D, topK: UInt32(cfg.topKExperts))
+                numExperts: UInt32(cfg.numExperts), d: D, topK: UInt32(cfg.topKExperts),
+                weightBits: routerWeightBits)
             cb.commit()
             let tWait = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
             waitForCompletion(cb)
@@ -1983,16 +1995,11 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             } else if cfg.sharedExpertGated {
                 // out = sigmoid(shared_expert_gate(moeX)) * shared_mlp(moeX)
                 let gateView = sharedProj.scalarGate!
-                int8ScalarGate!.encode(commandBuffer: sharedCB,
-                                       weights: gateView.buffer,
-                                       weightsOffset: Int(gateView.offset),
-                                       scales: gateView.buffer,
-                                       scalesOffset: Int(gateView.scaleOffset),
-                                       biases: gateView.buffer,
-                                       biasesOffset: Int(gateView.biasOffset),
-                                       x: routedX,
-                                       y: sharedScalarGateBuf!,
-                                       m: 1, n: D)
+                encodeScalarGate(sharedCB,
+                                 gateView: gateView,
+                                 x: routedX, xOffset: 0,
+                                 y: sharedScalarGateBuf!, yOffset: 0,
+                                 d: cfg.hiddenSize)
                 elementwise!.encodeSigmoidScalarMul(commandBuffer: sharedCB,
                                                     y: h1Buf,
                                                     gate: sharedScalarGateBuf!,
@@ -2223,7 +2230,40 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     x: gdnOut, y: oOut, m: D, n: UInt32(la.valueDim))
     }
 
-    /// Qwen full attention (attn_output_gate), one decode step: packed
+    /// Scalar shared-expert gate GEMV (`mlp.shared_expert_gate`, [1, D]).
+    /// The gate shares the router's quantization width: INT8 on Qwen 3.6,
+    /// INT4 on Qwen 3.5.
+    private func encodeScalarGate(_ cb: MTLCommandBuffer,
+                                  gateView: TensorView,
+                                  x: MTLBuffer, xOffset: Int,
+                                  y: MTLBuffer, yOffset: Int,
+                                  d: Int) {
+        if routerWeightBits == 4 {
+            int4.encode(commandBuffer: cb,
+                        weights: gateView.buffer,
+                        weightsOffset: Int(gateView.offset),
+                        scales: gateView.buffer,
+                        scalesOffset: Int(gateView.scaleOffset),
+                        biases: gateView.buffer,
+                        biasesOffset: Int(gateView.biasOffset),
+                        x: x, xOffset: xOffset,
+                        y: y, yOffset: yOffset,
+                        m: 1, n: UInt32(d))
+        } else {
+            int8ScalarGate!.encode(commandBuffer: cb,
+                                   weights: gateView.buffer,
+                                   weightsOffset: Int(gateView.offset),
+                                   scales: gateView.buffer,
+                                   scalesOffset: Int(gateView.scaleOffset),
+                                   biases: gateView.buffer,
+                                   biasesOffset: Int(gateView.biasOffset),
+                                   x: x, xOffset: xOffset,
+                                   y: y, yOffset: yOffset,
+                                   m: 1, n: UInt32(d))
+        }
+    }
+
+    /// Gated full attention (Qwen): packed
     /// [query ; gate] q_proj split per head, weighted per-head q/k norms
     /// (no V norm), NeoX sub-dim RoPE, full attention with the configured
     /// scale, sigmoid output gate, then o_proj into `oOut`.

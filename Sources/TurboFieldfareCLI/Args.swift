@@ -69,7 +69,7 @@ public enum ArgsError: Error, Equatable, CustomStringConvertible {
 
 extension Args {
     public static let usage = """
-    TurboFieldfareCLI — Gemma 4 26B-A4B / Qwen3.6 35B-A3B text generation
+    TurboFieldfareCLI — Gemma 4 26B-A4B / Qwen3.6 35B-A3B / Qwen3.5 122B-A10B text generation
 
     usage: TurboFieldfareCLI --model <dir> (--prompt <string> | --messages-file <path>) [options]
 

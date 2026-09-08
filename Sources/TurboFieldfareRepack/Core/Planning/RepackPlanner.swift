@@ -126,7 +126,7 @@ enum RepackPlanner {
         let routedContainer: String
         switch family {
         case .gemma4: routedContainer = ".experts.switch_glu."
-        case .qwen36: routedContainer = ".mlp.switch_mlp."
+        case .qwen36, .qwen35: routedContainer = ".mlp.switch_mlp."
         }
         guard name.contains(routedContainer) else { return nil }
         if name.contains(".gate_proj.") { return "gate" }
@@ -451,7 +451,7 @@ enum RepackPlanner {
                 let slot: Int
                 switch family {
                 case .gemma4: slot = slotRank(in: n)
-                case .qwen36: slot = qwenSlotRank(in: n)
+                case .qwen36, .qwen35: slot = qwenSlotRank(in: n)
                 }
                 return (1, li, slot, n)
             }
@@ -466,7 +466,7 @@ enum RepackPlanner {
         }
     }
 
-    /// Within-layer slot order for the Qwen 3.6 family: full-attention
+    /// Within-layer slot order for the Qwen 3.5/3.6 family: full-attention
     /// projections/norms, then the gated-DeltaNet linear-attention bundle,
     /// then router, shared-expert gate and MLP, then the two layer norms.
     private static func qwenSlotRank(in n: String) -> Int {

@@ -8,6 +8,7 @@ import Metal
 public enum ModelFamily: String, Sendable, Equatable {
     case gemma4 = "gemma4"
     case qwen36 = "qwen36"
+    case qwen35 = "qwen35"
 }
 
 /// Gated-DeltaNet (linear attention) dimensions. Zeroed for architectures
@@ -245,10 +246,62 @@ public struct ArchConfig: Sendable, Equatable {
         return mask
     }
 
+    /// Canonical Qwen3.5-122B-A10B baseline: the same `qwen3_5_moe` hybrid
+    /// contract as Qwen 3.6 (3 gated-DeltaNet linear layers + 1 full
+    /// attention, sigmoid-gated shared expert, SwiGLU, untied lm_head, no
+    /// logit softcap) at 48 layers / hidden 3072 / 32 query heads / 64
+    /// linear value heads / 1024-wide experts. Unlike Qwen 3.6, the router
+    /// (`mlp.gate`) and scalar shared-expert gate are 4-bit, so the runtime
+    /// dispatches the INT4 router/scalar-gate kernels (see `routerWeightBits`
+    /// on `Model`).
+    public static let qwen35_122B_A10B = ArchConfig(
+        hiddenSize: 3072,
+        intermediateSize: 1024,
+        moeIntermediateSize: 1024,
+        numHeads: 32,
+        numKVHeads: 2,
+        numFullKVHeads: 2,
+        headDim: 256,
+        fullHeadDim: 256,
+        vocabSize: 248_320,
+        slidingWindow: 0,
+        finalLogitSoftcap: 0.0,
+        ropeTheta: 10_000_000.0,
+        fullRopeTheta: 10_000_000.0,
+        partialRotaryFactor: 0.25,
+        numLayers: 48,
+        numExperts: 256,
+        topKExperts: 8,
+        tieWordEmbeddings: false,
+        attentionKEqV: false,
+        fullAttentionLayerMask: Self.qwen35LayerMask(),
+        hiddenActivation: "silu",
+        family: .qwen35,
+        attnOutputGate: true,
+        attentionScale: 0.0625,   // 256^-0.5
+        embeddingScaledBySqrtHidden: false,
+        routerScaled: false,
+        ffnSandwichNorms: false,
+        sharedExpertGated: true,
+        ropeNeoxSubdim: true,
+        linearAttention: LinearAttentionConfig(
+            numKHeads: 16, numVHeads: 64,
+            keyHeadDim: 128, valueHeadDim: 128,
+            convKernelSize: 4)
+    )
+
+    private static func qwen35LayerMask() -> [UInt8] {
+        // Same 3-linear + 1-full motif as Qwen 3.6, extended to 48 layers.
+        var mask = [UInt8](repeating: 2, count: 48)
+        for i in stride(from: 3, to: 48, by: 4) { mask[i] = 1 }
+        return mask
+    }
+
     /// Registry keyed by `manifest.arch.family` for auto-detection at load.
     public static let knownArchitectures: [ModelFamily: ArchConfig] = [
         .gemma4: .gemma4_26B_A4B,
         .qwen36: .qwen36_35B_A3B,
+        .qwen35: .qwen35_122B_A10B,
     ]
 
     /// Resident INT4 GEMV shapes this architecture issues during decode, for

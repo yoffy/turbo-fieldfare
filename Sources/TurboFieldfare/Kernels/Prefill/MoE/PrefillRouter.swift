@@ -29,9 +29,11 @@ public struct PrefillTokenExpertPair: Equatable, Sendable {
 
 final class PrefillRouter {
     private let pso: MTLComputePipelineState
+    private let psoInt4: MTLComputePipelineState
 
     init(context: MetalContext) throws {
         self.pso = try context.pipeline("prefill_router_gemma4_block")
+        self.psoInt4 = try context.pipeline("prefill_router_int4_block")
     }
 
     func encodeGemma4Block(commandBuffer: MTLCommandBuffer,
@@ -51,19 +53,22 @@ final class PrefillRouter {
                                   outIndicesOffset: Int = 0,
                                   outWeights: MTLBuffer,
                                   outWeightsOffset: Int = 0,
-                                  queryCount: UInt32,
-                                  numExperts: UInt32,
-                                  d: UInt32,
-                                  topK: UInt32,
-                                  hiddenStrideElements: UInt32) {
+                                   queryCount: UInt32,
+                                   numExperts: UInt32,
+                                   d: UInt32,
+                                   topK: UInt32,
+                                   hiddenStrideElements: UInt32,
+                                   weightBits: Int = 8) {
         precondition(queryCount > 0, "queryCount must be positive")
         precondition(numExperts <= 256, "numExperts > 256 is not supported")
         precondition(topK > 0 && topK <= 64, "topK must be in 1...64")
         precondition(d % UInt32(Quantization.groupSize) == 0,
                      "D must be a multiple of \(Quantization.groupSize)")
         precondition(hiddenStrideElements >= d, "hidden stride is too small")
+        precondition(weightBits == 8 || weightBits == 4,
+                     "router weight bits must be 8 or 4")
         guard let enc = commandBuffer.makeComputeCommandEncoder() else { return }
-        enc.setComputePipelineState(pso)
+        enc.setComputePipelineState(weightBits == 4 ? psoInt4 : pso)
         enc.setBuffer(weights, offset: weightsOffset, index: 0)
         enc.setBuffer(scales, offset: scalesOffset, index: 1)
         enc.setBuffer(biases, offset: biasesOffset, index: 2)

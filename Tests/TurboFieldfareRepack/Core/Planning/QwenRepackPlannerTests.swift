@@ -82,45 +82,96 @@ struct QwenRepackPlannerTests {
         }
     }
 
+    @Test func productionQwen35ConfigParsesAndCrossChecks() throws {
+        let root = temporaryRoot("qwen35-prod")
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let configPath = (root as NSString).appendingPathComponent("config.json")
+        try writeProductionConfig(to: configPath, mutate: { _ in }, qwen35: true)
+
+        let arch = try ArchInfo.load(configPath: configPath)
+        #expect(arch.family == .qwen35)
+        #expect(arch.hiddenSize == 3072)
+        #expect(arch.numLayers == 48)
+        #expect(arch.numHeads == 32)
+        #expect(arch.vocabSize == 248_320)
+        #expect(arch.numExperts == 256)
+        #expect(arch.topKExperts == 8)
+        #expect(arch.intermediateSize == 1024)
+        #expect(arch.moeIntermediateSize == 1024)
+        #expect(arch.attentionScale == 0.0625) // 256^-0.5
+        #expect(arch.attnOutputGate == true)
+        #expect(arch.routerScaled == false)
+        #expect(arch.ffnSandwichNorms == false)
+        #expect(arch.sharedExpertGated == true)
+        #expect(arch.ropeNeoxSubdim == true)
+        #expect(arch.linearNumKHeads == 16)
+        #expect(arch.linearNumVHeads == 64)
+        #expect(arch.linearKeyHeadDim == 128)
+        #expect(arch.linearValueHeadDim == 128)
+        #expect(arch.linearConvKernelSize == 4)
+        #expect(arch.fullAttentionLayerMask.count == 48)
+        #expect(arch.fullAttentionLayerMask.filter { $0 == 1 }.count == 12)
+        for (i, v) in arch.fullAttentionLayerMask.enumerated() {
+            #expect(v == ((i + 1) % 4 == 0 ? 1 : 2))
+        }
+    }
+
+    @Test func productionQwen35ConfigMismatchIsRejected() throws {
+        let root = temporaryRoot("qwen35-prod-bad")
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let configPath = (root as NSString).appendingPathComponent("config.json")
+        try writeProductionConfig(to: configPath, mutate: { tc in
+            tc["linear_num_value_heads"] = 32
+        }, qwen35: true)
+
+        #expect(throws: RepackError.self) {
+            _ = try ArchInfo.load(configPath: configPath)
+        }
+    }
+
     @Test func qwenSourceFingerprintIsKnown() {
         #expect(SourceFingerprint.modelID(forIndexSha256:
             "0b28df60e33753a14e816d3b31577ae2c93884c58430a4a6de6ae9ea483842ea")
             == "qwen3.6-35b-a3b-4bit")
+        #expect(SourceFingerprint.modelID(forIndexSha256:
+            "e6bbd20503bb8f43b7df32983a5711e7fb54785807c296614801d7209ab40222")
+            == "qwen3.5-122b-a10b-4bit")
         #expect(SourceFingerprint.modelID(forIndexSha256:
             "bf198c9f5ea6462addca1966e5dd669c407537a876e82cf06db9084c5c850b13")
             == "mlx-community/gemma-4-26b-a4b-it-4bit")
     }
 
     @Test func qwenClassificationBucketsNames() {
-        let f = RepackModelFamily.qwen36
-        #expect(RepackPlanner.classify(
-            "language_model.model.layers.1.mlp.switch_mlp.gate_proj.weight",
-            numLayers: 4, family: f)
-            == .routedExpert(role: "gate", layer: 1))
-        #expect(RepackPlanner.classify(
-            "language_model.model.layers.2.mlp.switch_mlp.down_proj.weight",
-            numLayers: 4, family: f)
-            == .routedExpert(role: "down", layer: 2))
-        // The shared expert and its gate stay resident.
-        #expect(RepackPlanner.classify(
-            "language_model.model.layers.0.mlp.shared_expert.gate_proj.weight",
-            numLayers: 4, family: f) == .lmResident)
-        #expect(RepackPlanner.classify(
-            "language_model.model.layers.0.mlp.shared_expert_gate.weight",
-            numLayers: 4, family: f) == .lmResident)
-        // Untied head and the DeltaNet bundle are resident.
-        #expect(RepackPlanner.classify(
-            "language_model.lm_head.weight", numLayers: 4, family: f) == .lmResident)
-        #expect(RepackPlanner.classify(
-            "language_model.model.layers.0.linear_attn.conv1d.weight",
-            numLayers: 4, family: f) == .lmResident)
-        // Vision is excluded; unknown prefixes stay unknown.
-        #expect(RepackPlanner.classify(
-            "vision_tower.blocks.0.norm1.weight", numLayers: 4, family: f)
-            == .excludedMultimodal)
-        #expect(RepackPlanner.classify(
-            "model.layers.0.mlp.switch_mlp.gate_proj.weight",
-            numLayers: 4, family: f) == .unknown)
+        for family in [RepackModelFamily.qwen36, RepackModelFamily.qwen35] {
+            #expect(RepackPlanner.classify(
+                "language_model.model.layers.1.mlp.switch_mlp.gate_proj.weight",
+                numLayers: 4, family: family)
+                == .routedExpert(role: "gate", layer: 1))
+            #expect(RepackPlanner.classify(
+                "language_model.model.layers.2.mlp.switch_mlp.down_proj.weight",
+                numLayers: 4, family: family)
+                == .routedExpert(role: "down", layer: 2))
+            // The shared expert and its gate stay resident.
+            #expect(RepackPlanner.classify(
+                "language_model.model.layers.0.mlp.shared_expert.gate_proj.weight",
+                numLayers: 4, family: family) == .lmResident)
+            #expect(RepackPlanner.classify(
+                "language_model.model.layers.0.mlp.shared_expert_gate.weight",
+                numLayers: 4, family: family) == .lmResident)
+            // Untied head and the DeltaNet bundle are resident.
+            #expect(RepackPlanner.classify(
+                "language_model.lm_head.weight", numLayers: 4, family: family) == .lmResident)
+            #expect(RepackPlanner.classify(
+                "language_model.model.layers.0.linear_attn.conv1d.weight",
+                numLayers: 4, family: family) == .lmResident)
+            // Vision is excluded; unknown prefixes stay unknown.
+            #expect(RepackPlanner.classify(
+                "vision_tower.blocks.0.norm1.weight", numLayers: 4, family: family)
+                == .excludedMultimodal)
+            #expect(RepackPlanner.classify(
+                "model.layers.0.mlp.switch_mlp.gate_proj.weight",
+                numLayers: 4, family: family) == .unknown)
+        }
     }
 
     @Test func qwenPlanOrdersResidentsAndSlicesExperts() throws {
@@ -266,20 +317,22 @@ struct QwenRepackPlannerTests {
 
     private func writeProductionConfig(
         to path: String,
-        mutate: (inout [String: Any]) -> Void) throws {
+        mutate: (inout [String: Any]) -> Void,
+        qwen35: Bool = false) throws {
+        let numLayers = qwen35 ? 48 : 40
         var layerTypes: [String] = []
-        for i in 0..<40 {
+        for i in 0..<numLayers {
             layerTypes.append((i + 1) % 4 == 0 ? "full_attention" : "linear_attention")
         }
         var tc: [String: Any] = [
-            "hidden_size": 2048,
-            "moe_intermediate_size": 512,
-            "shared_expert_intermediate_size": 512,
-            "num_attention_heads": 16,
+            "hidden_size": qwen35 ? 3072 : 2048,
+            "moe_intermediate_size": qwen35 ? 1024 : 512,
+            "shared_expert_intermediate_size": qwen35 ? 1024 : 512,
+            "num_attention_heads": qwen35 ? 32 : 16,
             "num_key_value_heads": 2,
             "head_dim": 256,
             "vocab_size": 248_320,
-            "num_hidden_layers": 40,
+            "num_hidden_layers": numLayers,
             "num_experts": 256,
             "num_experts_per_tok": 8,
             "layer_types": layerTypes,
@@ -289,7 +342,7 @@ struct QwenRepackPlannerTests {
                 "partial_rotary_factor": 0.25
             ],
             "linear_num_key_heads": 16,
-            "linear_num_value_heads": 32,
+            "linear_num_value_heads": qwen35 ? 64 : 32,
             "linear_key_head_dim": 128,
             "linear_value_head_dim": 128,
             "linear_conv_kernel_dim": 4,

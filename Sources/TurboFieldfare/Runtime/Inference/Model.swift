@@ -34,6 +34,12 @@ public struct Model {
     public var modelID: String { manifest.modelID }
     public var sourceSnapshotHash: String? { manifest.sourceSnapshotHash }
     public var sharedExpertWeightBits: Int { manifest.quant?.sharedExpert.weightBits ?? 8 }
+    /// Router (`mlp.gate`) weight bits. Qwen 3.6 ships an 8-bit router while
+    /// Qwen 3.5 ships a 4-bit router; the runner selects the matching
+    /// router/scalar-gate GEMV kernels from this. The scalar shared-expert
+    /// gate (`mlp.shared_expert_gate`) is quantized identically to the router
+    /// in both pinned checkpoints, so it shares this width.
+    public var routerWeightBits: Int { manifest.quant?.router.weightBits ?? 8 }
 
     let residentBuffer: ResidentBuffer
     let residentIndex: ResidentIndex
@@ -111,7 +117,7 @@ public struct Model {
         switch config.family {
         case .gemma4:
             return try resident(name: "language_model.model.layers.\(L).router.proj.weight")
-        case .qwen36:
+        case .qwen36, .qwen35:
             return try resident(name: "language_model.model.layers.\(L).mlp.gate.weight")
         }
     }
@@ -131,7 +137,7 @@ public struct Model {
         switch config.family {
         case .gemma4:
             return "language_model.model.layers.\(L).mlp.\(proj).weight"
-        case .qwen36:
+        case .qwen36, .qwen35:
             return "language_model.model.layers.\(L).mlp.shared_expert.\(proj).weight"
         }
     }

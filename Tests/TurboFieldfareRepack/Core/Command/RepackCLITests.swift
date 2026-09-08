@@ -94,6 +94,19 @@ struct RepackCLITests {
         #expect(result.stderr.contains("no resumable install state exists"))
     }
 
+    @Test func qwen35ModelSelectorIsAccepted() throws {
+        let output = temporaryOutput("qwen35-model")
+        defer { clean(output) }
+        let result = try run([
+            "--model", "qwen35",
+            "--output", output,
+            "--resume",
+        ])
+
+        #expect(result.status == 1)
+        #expect(result.stderr.contains("no resumable install state exists"))
+    }
+
     private func run(_ arguments: [String]) throws
         -> (status: Int32, stdout: String, stderr: String) {
         let executable = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
