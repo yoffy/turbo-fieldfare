@@ -10,6 +10,12 @@ private func isLoopbackHost(_ host: String) -> Bool {
         || normalized.hasPrefix("127.")
 }
 
+private func logTimestamp() -> String {
+    let formatter = ISO8601DateFormatter()
+    formatter.timeZone = .current
+    return formatter.string(from: Date())
+}
+
 let arguments: ServerArguments
 do {
     arguments = try ServerArguments.parse(Array(CommandLine.arguments.dropFirst()))
@@ -17,7 +23,7 @@ do {
     print(ServerArguments.usage)
     exit(0)
 } catch {
-    FileHandle.standardError.write(Data("error: \(error)\n\n\(ServerArguments.usage)\n".utf8))
+    FileHandle.standardError.write(Data("[\(logTimestamp())] error: \(error)\n\n\(ServerArguments.usage)\n".utf8))
     exit(2)
 }
 
@@ -35,15 +41,15 @@ do {
         backend: backend,
         chatDialect: backend.chatDialect)
     _ = try await server.start(port: arguments.port, host: arguments.host)
-    print("TurboFieldfareServer ready at http://\(arguments.host):\(arguments.port) model=\(modelID) context=\(arguments.maxContext) prompt_cache=\(arguments.promptCacheMode.rawValue)")
+    print("[\(logTimestamp())] TurboFieldfareServer ready at http://\(arguments.host):\(arguments.port) model=\(modelID) context=\(arguments.maxContext) prompt_cache=\(arguments.promptCacheMode.rawValue)")
     if !isLoopbackHost(arguments.host) {
-        FileHandle.standardError.write(Data("warning: binding to non-loopback address '\(arguments.host)' exposes the server without authentication or TLS\n".utf8))
+        FileHandle.standardError.write(Data("[\(logTimestamp())] warning: binding to non-loopback address '\(arguments.host)' exposes the server without authentication or TLS\n".utf8))
     }
 
     _ = await signals.wait()
     try await server.shutdown()
     await signals.cancel()
 } catch {
-    FileHandle.standardError.write(Data("error: \(error)\n".utf8))
+    FileHandle.standardError.write(Data("[\(logTimestamp())] error: \(error)\n".utf8))
     exit(1)
 }

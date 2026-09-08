@@ -377,8 +377,13 @@ public actor ServerModelSession: ServerInferenceBackend {
         let prefillTokensPerSecond = result.prefillSeconds > 0
             ? Double(result.computedPrefillTokens) / result.prefillSeconds
             : 0
+        let timestamp = {
+            let formatter = ISO8601DateFormatter()
+            formatter.timeZone = .current
+            return formatter.string(from: Date())
+        }()
         let line =
-            "[chat.completion stop=\(finishReason)"
+            "[\(timestamp) chat.completion stop=\(finishReason)"
             + " prefill=\(result.prefillTokens)tok/\(String(format: "%.2f", result.prefillSeconds))s"
             + " (\(String(format: "%.1f", prefillTokensPerSecond)) tok/s,"
             + " computed=\(result.computedPrefillTokens)"
