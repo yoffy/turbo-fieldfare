@@ -357,6 +357,7 @@ public actor ServerModelSession: ServerInferenceBackend {
                 stopStringFiltered: stopMatcher.isStopped)
         }
         completed = true
+        logCompletion(result: result, finishReason: reason)
         return ServerCompletion(
             content: content,
             toolCalls: calls,
@@ -365,5 +366,25 @@ public actor ServerModelSession: ServerInferenceBackend {
                                completionTokens: result.newTokens,
                                totalTokens: result.prefillTokens + result.newTokens,
                                cachedTokens: result.cachedPromptTokens))
+    }
+
+    /// Per-request prefill/decode timing. Same counters as the CLI footer,
+    /// written to stderr so it never pollutes the HTTP JSON body.
+    private func logCompletion(result: RawDecodeResult, finishReason: String) {
+        let decodeTokensPerSecond = result.decodeSeconds > 0
+            ? Double(result.newTokens) / result.decodeSeconds
+            : 0
+        let prefillTokensPerSecond = result.prefillSeconds > 0
+            ? Double(result.computedPrefillTokens) / result.prefillSeconds
+            : 0
+        let line =
+            "[chat.completion stop=\(finishReason)"
+            + " prefill=\(result.prefillTokens)tok/\(String(format: "%.2f", result.prefillSeconds))s"
+            + " (\(String(format: "%.1f", prefillTokensPerSecond)) tok/s,"
+            + " computed=\(result.computedPrefillTokens)"
+            + " cached=\(result.cachedPromptTokens))"
+            + " new=\(result.newTokens)tok/\(String(format: "%.2f", result.decodeSeconds))s"
+            + " (\(String(format: "%.2f", decodeTokensPerSecond)) tok/s)]\n"
+        FileHandle.standardError.write(Data(line.utf8))
     }
 }
