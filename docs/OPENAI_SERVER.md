@@ -140,6 +140,6 @@ The server supports one model and one choice. It does not support the Responses
 API, legacy Completions, embeddings, multimodal input, structured output,
 batching, log probabilities, or remote model switching.
 
-Context length can be 4K, 8K, 16K, 32K, or 64K. The default is 16K. Larger FP16
+`--max-context` accepts any positive token count. The default is 16K. Larger FP16
 KV contexts use more memory. On an 8 GB Mac, run one model process at a time and
 watch memory pressure.
