@@ -33,7 +33,8 @@ do {
     let backend = try await ServerModelSession.load(
         modelDirectory: modelURL,
         maxContext: arguments.maxContext,
-        promptCacheMode: arguments.promptCacheMode)
+        promptCacheMode: arguments.promptCacheMode,
+        prefillChunkTokens: arguments.prefillChunkTokens)
     let modelID = arguments.modelIDOverride ?? backend.defaultModelID
     let server = TurboFieldfareHTTPServer(
         modelID: modelID,
@@ -41,7 +42,7 @@ do {
         backend: backend,
         chatDialect: backend.chatDialect)
     _ = try await server.start(port: arguments.port, host: arguments.host)
-    print("[\(logTimestamp())] TurboFieldfareServer ready at http://\(arguments.host):\(arguments.port) model=\(modelID) context=\(arguments.maxContext) prompt_cache=\(arguments.promptCacheMode.rawValue)")
+    print("[\(logTimestamp())] TurboFieldfareServer ready at http://\(arguments.host):\(arguments.port) model=\(modelID) context=\(arguments.maxContext) prompt_cache=\(arguments.promptCacheMode.rawValue) prefill_chunk=\(arguments.prefillChunkTokens)")
     if !isLoopbackHost(arguments.host) {
         FileHandle.standardError.write(Data("[\(logTimestamp())] warning: binding to non-loopback address '\(arguments.host)' exposes the server without authentication or TLS\n".utf8))
     }

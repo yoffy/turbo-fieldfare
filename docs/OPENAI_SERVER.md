@@ -48,6 +48,13 @@ By default, the server runs one generation and queues up to four requests. Use
 `--queue-limit` to change the queue size. Use `--host` to change the bind
 address (default `127.0.0.1`). Press Control-C to stop the server.
 
+For very long contexts, prefill encodes up to `--prefill-chunk-tokens`
+(32, 64, or 128; default 128) tokens into each Metal command buffer. A large
+chunk on a huge KV cache can keep the GPU busy for seconds, and macOS may kill
+the buffer for impacting interactivity (`IOGPUCommandQueueErrorDomain Code=14`).
+If that happens, retry with a smaller chunk size and/or a smaller
+`--max-context`. Smaller chunks slow prefill but shorten each buffer.
+
 ## Connect a client
 
 The base URL is `http://127.0.0.1:8080/v1`. Some client libraries require an

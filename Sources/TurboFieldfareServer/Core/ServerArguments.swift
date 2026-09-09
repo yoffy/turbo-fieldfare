@@ -11,6 +11,10 @@ public struct ServerArguments: Equatable, Sendable {
     public let maxContext: Int
     public let queueLimit: Int
     public let promptCacheMode: ServerPromptCacheMode
+    /// Prefill chunk size in tokens. Smaller chunks shorten each Metal command
+    /// buffer, which helps very long contexts survive the OS interactivity
+    /// watchdog, at the cost of prefill throughput.
+    public let prefillChunkTokens: Int
 
     public static let usage = """
     usage: TurboFieldfareServer --model <completed .gturbo directory> [options]
@@ -27,6 +31,11 @@ public struct ServerArguments: Equatable, Sendable {
       --queue-limit <count>  Maximum queued requests (default 4).
       --prompt-cache-mode <off|single-prefix>
                              Prompt KV reuse mode (default single-prefix).
+      --prefill-chunk-tokens <32|64|128>
+                             Prefill chunk size in tokens (default 128).
+                             Smaller chunks shorten each Metal command buffer
+                             and are gentler on very long contexts, but slow
+                             prefill.
       --help                 Show this help.
     """
 
@@ -38,6 +47,7 @@ public struct ServerArguments: Equatable, Sendable {
         var maxContext = 16_384
         var queueLimit = 4
         var promptCacheMode: ServerPromptCacheMode = .singlePrefix
+        var prefillChunkTokens = 128
         var index = 0
         while index < input.count {
             let flag = input[index]
@@ -81,6 +91,13 @@ public struct ServerArguments: Equatable, Sendable {
                         "--prompt-cache-mode must be off or single-prefix")
                 }
                 promptCacheMode = parsed
+            case "--prefill-chunk-tokens":
+                guard let parsed = Int(value),
+                      [32, 64, 128].contains(parsed) else {
+                    throw ServerArgumentError.invalid(
+                        "--prefill-chunk-tokens must be 32, 64, or 128")
+                }
+                prefillChunkTokens = parsed
             default:
                 throw ServerArgumentError.invalid("unknown flag: \(flag)")
             }
@@ -92,7 +109,8 @@ public struct ServerArguments: Equatable, Sendable {
                                modelIDOverride: modelIDOverride,
                                maxContext: maxContext,
                                queueLimit: queueLimit,
-                               promptCacheMode: promptCacheMode)
+                               promptCacheMode: promptCacheMode,
+                               prefillChunkTokens: prefillChunkTokens)
     }
 }
 
