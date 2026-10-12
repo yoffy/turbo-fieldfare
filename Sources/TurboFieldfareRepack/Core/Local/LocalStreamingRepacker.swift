@@ -95,6 +95,7 @@ public final class LocalStreamingRepacker {
                                                   layoutOrderSha256: nil)
         let outputBytes = plan.resident.totalSize
             + plan.layers.reduce(UInt64(0)) { $0 + $1.fileSize }
+            + plan.pleShards.reduce(UInt64(0)) { $0 + $1.fileSize }
         progress(.planning(downloadBytes: rangePlan.remoteBytesToDownload,
                            outputBytes: outputBytes))
         let diskRequirement = try DiskSpaceChecker.requireAvailable(
@@ -138,6 +139,11 @@ public final class LocalStreamingRepacker {
             let rel = "packed_experts/" + (layer.path as NSString).lastPathComponent
             try recordOutputFile(relativePath: rel, path: layer.path, progress: progress)
         }
+        for shard in plan.pleShards {
+            try Task.checkCancellation()
+            let rel = "packed_ple/" + (shard.path as NSString).lastPathComponent
+            try recordOutputFile(relativePath: rel, path: shard.path, progress: progress)
+        }
 
         let layoutPath = ((paths.partialDirectory as NSString)
             .appendingPathComponent("packed_experts") as NSString)
@@ -149,6 +155,17 @@ public final class LocalStreamingRepacker {
         try recordOutputFile(relativePath: "packed_experts/layout.json",
                              path: layoutPath,
                              progress: progress)
+
+        if !plan.pleShards.isEmpty {
+            let pleLayoutPath = ((paths.partialDirectory as NSString)
+                .appendingPathComponent("packed_ple") as NSString)
+                .appendingPathComponent("layout.json")
+            let pleLayoutData = try GTurboJSON.encodePleLayout(plan: plan)
+            try writeSmall(path: pleLayoutPath, data: pleLayoutData)
+            try recordOutputFile(relativePath: "packed_ple/layout.json",
+                                 path: pleLayoutPath,
+                                 progress: progress)
+        }
 
         try Task.checkCancellation()
         try copyLocalMetadataSidecars(snapshot: snapshot,
@@ -198,6 +215,10 @@ public final class LocalStreamingRepacker {
                                    paths: RemoteInstallPaths) throws {
         try Posix.mkdirP((paths.partialDirectory as NSString)
             .appendingPathComponent("packed_experts"))
+        if !plan.pleShards.isEmpty {
+            try Posix.mkdirP((paths.partialDirectory as NSString)
+                .appendingPathComponent("packed_ple"))
+        }
         let resident = try ResidentWriter.createAndWriteIndex(
             plan: plan.resident,
             audit: audit)
@@ -208,6 +229,13 @@ public final class LocalStreamingRepacker {
             let descriptor = try Posix.openCreateRW(layer.path)
             try Posix.ftruncate(descriptor, path: layer.path, size: layer.fileSize)
             try Posix.fsync(descriptor, path: layer.path)
+            close(descriptor)
+        }
+        for shard in plan.pleShards {
+            try Task.checkCancellation()
+            let descriptor = try Posix.openCreateRW(shard.path)
+            try Posix.ftruncate(descriptor, path: shard.path, size: shard.fileSize)
+            try Posix.fsync(descriptor, path: shard.path)
             close(descriptor)
         }
         try Posix.fsyncDirectory(paths.partialDirectory)
@@ -293,26 +321,33 @@ public final class LocalStreamingRepacker {
         for e in plan.resident.entries {
             if e.name == "language_model.model.embed_tokens.weight", let s = e.quantSpec {
                 bits.embedding = s.bits
+                bits.embeddingGroup = s.groupSize
             }
             if e.name.hasSuffix(".self_attn.q_proj.weight")
                 || e.name.hasSuffix(".linear_attn.in_proj_qkv.weight"),
                let s = e.quantSpec {
                 bits.attention = s.bits
+                bits.attentionGroup = s.groupSize
             }
             if e.name.hasSuffix(".router.proj.weight")
                 || e.name.hasSuffix(".mlp.gate.weight"),
                let s = e.quantSpec {
                 bits.router = s.bits
+                bits.routerGroup = s.groupSize
             }
             if e.name.hasSuffix(".mlp.gate_proj.weight")
                 || e.name.hasSuffix(".mlp.shared_expert.gate_proj.weight"),
                let s = e.quantSpec {
                 bits.sharedExpert = s.bits
+                bits.sharedExpertGroup = s.groupSize
             }
         }
         if let layer = plan.layers.first(where: { !$0.subTensors.isEmpty }),
            let routedBits = layer.subTensors.first?.bitsForWeights {
             bits.routedExpert = routedBits
+            // The routed-expert group travels with the base: qwen38 packs
+            // experts 32-wide, older families 64-wide.
+            bits.routedExpertGroup = plan.baseGroupSize
         }
         let files = audit.outputFiles.map {
             ($0.relativePath, GTurboJSON.FileEntry(size: $0.size, sha256: $0.sha256))

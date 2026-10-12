@@ -88,6 +88,26 @@ public enum RangeCopyPlanner {
             }
         }
 
+        // SSD-streamed PLE n-gram shards: weight bytes, then scales, then
+        // biases, packed contiguously per shard file.
+        for shard in repackPlan.pleShards {
+            copies.append(RangeCopy(shardID: shard.sourceWeight.shardPath,
+                                    sourceOffset: shard.sourceWeight.absoluteOffset,
+                                    size: shard.weightBytes,
+                                    destinationPath: shard.path,
+                                    destinationOffset: 0))
+            copies.append(RangeCopy(shardID: shard.sourceScales.shardPath,
+                                    sourceOffset: shard.sourceScales.absoluteOffset,
+                                    size: shard.scalesBytes,
+                                    destinationPath: shard.path,
+                                    destinationOffset: shard.weightBytes))
+            copies.append(RangeCopy(shardID: shard.sourceBiases.shardPath,
+                                    sourceOffset: shard.sourceBiases.absoluteOffset,
+                                    size: shard.biasesBytes,
+                                    destinationPath: shard.path,
+                                    destinationOffset: shard.weightBytes + shard.scalesBytes))
+        }
+
         try validateDestinationIntervals(copies, outputRoot: outputRoot(for: repackPlan))
         let coalesced = try coalesce(copies: copies, rangeChunkBytes: rangeChunkBytes)
         let indexData = try ResidentWriter.encodeIndex(plan: repackPlan.resident)
@@ -211,6 +231,11 @@ public enum RangeCopyPlanner {
                     relativePath: "packed_experts/" + ($0.path as NSString).lastPathComponent,
                     size: $0.fileSize)
             })
+        outputs.append(contentsOf: plan.pleShards.map {
+            RemoteExpectedOutput(
+                relativePath: "packed_ple/" + ($0.path as NSString).lastPathComponent,
+                size: $0.fileSize)
+        })
         return outputs.sorted { $0.relativePath < $1.relativePath }
     }
 

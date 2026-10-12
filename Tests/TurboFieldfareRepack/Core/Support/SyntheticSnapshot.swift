@@ -425,6 +425,306 @@ enum SyntheticSnapshot {
         return Snapshot(shardPath: shardPath)
     }
 
+    // MARK: - Qwen 3.8 variant
+
+    /// Tiny `qwen4_exp`-shaped architecture: three gated-DeltaNet linear
+    /// layers plus one QSA full-attention layer, two routed experts, an
+    /// untied lm_head, per-sublayer gated residuals, and a 4-shard PLE
+    /// n-gram table on layer 1. Mirrors production quantization: a 32-wide
+    /// 4-bit base with 64-wide 8-bit router gates.
+    struct Qwen38Arch {
+        let hidden: Int = 128
+        let moeIntermediate: Int = 64
+        let sharedIntermediate: Int = 64
+        let numHeads: Int = 2
+        let numKVHeads: Int = 2
+        let headDim: Int = 64
+        let vocab: Int = 256
+        let numLayers: Int = 4
+        let numExperts: Int = 2
+        let topK: Int = 2
+        let groupSize: Int = 32
+        let gateGroupSize: Int = 64
+        let linearNumKHeads: Int = 2
+        let linearNumVHeads: Int = 4
+        let linearKeyHeadDim: Int = 32
+        let linearValueHeadDim: Int = 32
+        let linearConvKernelSize: Int = 4
+        let hcCount: Int = 2
+        let hcLowrank: Int = 32
+        let pleShards: Int = 4
+        let pleShardVocab: Int = 32
+        let pleEmbedDim: Int = 64
+        let indexerNHeads: Int = 2
+        let indexerKvHeads: Int = 1
+        let indexerHeadDim: Int = 32
+        // layers 0-2 = linear attention, layer 3 = QSA full attention
+        let layerTypes: [String] = ["linear_attention", "linear_attention",
+                                    "linear_attention", "full_attention"]
+        /// Fused qkv rows: 2 * K-dim + V-dim. Also the conv1d channel count.
+        var qkvDim: Int { 2 * linearNumKHeads * linearKeyHeadDim + linearNumVHeads * linearValueHeadDim }
+        var valueDim: Int { linearNumVHeads * linearValueHeadDim }
+        var hcHidden: Int { hcCount * hidden }
+    }
+
+    static func buildQwen38(at dir: String,
+                            seed: UInt64 = 0x38F1A5E500000001) throws -> Snapshot {
+        try? FileManager.default.removeItem(atPath: dir)
+        try FileManager.default.createDirectory(atPath: dir,
+                                                withIntermediateDirectories: true)
+
+        let arch = Qwen38Arch()
+        var rng = SplitMix64(seed: seed)
+
+        var tensors: [(String, String, [Int], [UInt8])] = []
+        tensors.reserveCapacity(256)
+
+        // -- Embedding + untied lm_head (4-bit, group=32)
+        appendQuantizedWeight(name: "language_model.model.embed_tokens",
+                              outerShape: [arch.vocab],
+                              innerLogical: arch.hidden, bits: 4,
+                              groupSize: arch.groupSize, into: &tensors, rng: &rng)
+        appendQuantizedWeight(name: "language_model.lm_head",
+                              outerShape: [arch.vocab],
+                              innerLogical: arch.hidden, bits: 4,
+                              groupSize: arch.groupSize, into: &tensors, rng: &rng)
+
+        for li in 0..<arch.numLayers {
+            let prefix = "language_model.model.layers.\(li)"
+            if arch.layerTypes[li] == "full_attention" {
+                // QSA layer: gated q_proj plus k/v/o and the indexer bundle.
+                appendQuantizedWeight(name: prefix + ".self_attn.q_proj",
+                                      outerShape: [2 * arch.numHeads * arch.headDim],
+                                      innerLogical: arch.hidden, bits: 4,
+                                      groupSize: arch.groupSize, into: &tensors, rng: &rng)
+                appendQuantizedWeight(name: prefix + ".self_attn.k_proj",
+                                      outerShape: [arch.numKVHeads * arch.headDim],
+                                      innerLogical: arch.hidden, bits: 4,
+                                      groupSize: arch.groupSize, into: &tensors, rng: &rng)
+                appendQuantizedWeight(name: prefix + ".self_attn.v_proj",
+                                      outerShape: [arch.numKVHeads * arch.headDim],
+                                      innerLogical: arch.hidden, bits: 4,
+                                      groupSize: arch.groupSize, into: &tensors, rng: &rng)
+                appendQuantizedWeight(name: prefix + ".self_attn.o_proj",
+                                      outerShape: [arch.hidden],
+                                      innerLogical: arch.numHeads * arch.headDim, bits: 4,
+                                      groupSize: arch.groupSize, into: &tensors, rng: &rng)
+                appendUnquantizedBF16(name: prefix + ".self_attn.q_norm.weight",
+                                      shape: [arch.headDim], into: &tensors, rng: &rng)
+                appendUnquantizedBF16(name: prefix + ".self_attn.k_norm.weight",
+                                      shape: [arch.headDim], into: &tensors, rng: &rng)
+                appendQuantizedWeight(name: prefix + ".self_attn.indexer.index_qk_proj",
+                                      outerShape: [(arch.indexerNHeads + arch.indexerKvHeads) * arch.indexerHeadDim],
+                                      innerLogical: arch.hidden, bits: 4,
+                                      groupSize: arch.groupSize, into: &tensors, rng: &rng)
+                appendUnquantizedBF16(name: prefix + ".self_attn.indexer.q_layernorm.weight",
+                                      shape: [arch.indexerHeadDim], into: &tensors, rng: &rng)
+                appendUnquantizedBF16(name: prefix + ".self_attn.indexer.k_layernorm.weight",
+                                      shape: [arch.indexerHeadDim], into: &tensors, rng: &rng)
+            } else {
+                // Gated-DeltaNet linear attention bundle.
+                appendQuantizedWeight(name: prefix + ".linear_attn.in_proj_qkv",
+                                      outerShape: [arch.qkvDim],
+                                      innerLogical: arch.hidden, bits: 4,
+                                      groupSize: arch.groupSize, into: &tensors, rng: &rng)
+                appendQuantizedWeight(name: prefix + ".linear_attn.in_proj_z",
+                                      outerShape: [arch.valueDim],
+                                      innerLogical: arch.hidden, bits: 4,
+                                      groupSize: arch.groupSize, into: &tensors, rng: &rng)
+                appendQuantizedWeight(name: prefix + ".linear_attn.in_proj_a",
+                                      outerShape: [arch.linearNumVHeads],
+                                      innerLogical: arch.hidden, bits: 4,
+                                      groupSize: arch.groupSize, into: &tensors, rng: &rng)
+                appendQuantizedWeight(name: prefix + ".linear_attn.in_proj_b",
+                                      outerShape: [arch.linearNumVHeads],
+                                      innerLogical: arch.hidden, bits: 4,
+                                      groupSize: arch.groupSize, into: &tensors, rng: &rng)
+                appendUnquantizedBF16(name: prefix + ".linear_attn.conv1d.weight",
+                                      shape: [arch.qkvDim, arch.linearConvKernelSize, 1],
+                                      into: &tensors, rng: &rng)
+                appendUnquantizedBF16(name: prefix + ".linear_attn.A_log",
+                                      shape: [arch.linearNumVHeads], into: &tensors, rng: &rng)
+                appendUnquantizedBF16(name: prefix + ".linear_attn.dt_bias",
+                                      shape: [arch.linearNumVHeads], into: &tensors, rng: &rng)
+                appendUnquantizedBF16(name: prefix + ".linear_attn.norm.weight",
+                                      shape: [arch.linearValueHeadDim], into: &tensors, rng: &rng)
+                appendQuantizedWeight(name: prefix + ".linear_attn.out_proj",
+                                      outerShape: [arch.hidden],
+                                      innerLogical: arch.valueDim, bits: 4,
+                                      groupSize: arch.groupSize, into: &tensors, rng: &rng)
+            }
+
+            // Router + sigmoid-gated shared expert. The two scalar gates are
+            // 8-bit/64-wide overrides like production; the experts are 4-bit.
+            appendQuantizedWeight(name: prefix + ".mlp.gate",
+                                  outerShape: [arch.numExperts], innerLogical: arch.hidden,
+                                  bits: 8, groupSize: arch.gateGroupSize, into: &tensors, rng: &rng)
+            appendQuantizedWeight(name: prefix + ".mlp.shared_expert_gate",
+                                  outerShape: [1], innerLogical: arch.hidden,
+                                  bits: 8, groupSize: arch.gateGroupSize, into: &tensors, rng: &rng)
+            appendQuantizedWeight(name: prefix + ".mlp.shared_expert.gate_proj",
+                                  outerShape: [arch.sharedIntermediate], innerLogical: arch.hidden,
+                                  bits: 4, groupSize: arch.groupSize, into: &tensors, rng: &rng)
+            appendQuantizedWeight(name: prefix + ".mlp.shared_expert.up_proj",
+                                  outerShape: [arch.sharedIntermediate], innerLogical: arch.hidden,
+                                  bits: 4, groupSize: arch.groupSize, into: &tensors, rng: &rng)
+            appendQuantizedWeight(name: prefix + ".mlp.shared_expert.down_proj",
+                                  outerShape: [arch.hidden], innerLogical: arch.sharedIntermediate,
+                                  bits: 4, groupSize: arch.groupSize, into: &tensors, rng: &rng)
+
+            // Routed experts — stacked expert-major, 4-bit.
+            appendQuantizedWeight(name: prefix + ".mlp.switch_mlp.gate_proj",
+                                  outerShape: [arch.numExperts, arch.moeIntermediate],
+                                  innerLogical: arch.hidden, bits: 4,
+                                  groupSize: arch.groupSize, into: &tensors, rng: &rng)
+            appendQuantizedWeight(name: prefix + ".mlp.switch_mlp.up_proj",
+                                  outerShape: [arch.numExperts, arch.moeIntermediate],
+                                  innerLogical: arch.hidden, bits: 4,
+                                  groupSize: arch.groupSize, into: &tensors, rng: &rng)
+            appendQuantizedWeight(name: prefix + ".mlp.switch_mlp.down_proj",
+                                  outerShape: [arch.numExperts, arch.hidden],
+                                  innerLogical: arch.moeIntermediate, bits: 4,
+                                  groupSize: arch.groupSize, into: &tensors, rng: &rng)
+
+            // Gated residuals (hyper-connections) wrap each sub-layer. No
+            // classic layer norms exist in this family.
+            for hc in ["attn_hyper_connection", "mlp_hyper_connection"] {
+                appendUnquantizedBF16(name: prefix + ".\(hc).hc_norm.weight",
+                                      shape: [arch.hcHidden], into: &tensors, rng: &rng)
+                appendQuantizedWeight(name: prefix + ".\(hc).input_mix_weight_down",
+                                      outerShape: [arch.hcLowrank], innerLogical: arch.hcHidden,
+                                      bits: 4, groupSize: arch.groupSize, into: &tensors, rng: &rng)
+                appendQuantizedWeight(name: prefix + ".\(hc).input_mix_weight_up",
+                                      outerShape: [arch.hcHidden], innerLogical: arch.hcLowrank,
+                                      bits: 4, groupSize: arch.groupSize, into: &tensors, rng: &rng)
+                appendQuantizedWeight(name: prefix + ".\(hc).block_inject_weight",
+                                      outerShape: [arch.hcCount], innerLogical: arch.hcHidden,
+                                      bits: 4, groupSize: arch.groupSize, into: &tensors, rng: &rng)
+            }
+
+            // PLE n-gram table lives on layer 1 only: streamed shards plus
+            // resident lookup projections and norms.
+            if li == 1 {
+                for shard in 0..<arch.pleShards {
+                    appendQuantizedWeight(
+                        name: prefix + ".ple.ple_embedding.ngram_embedding.shards.\(shard)",
+                        outerShape: [arch.pleShardVocab],
+                        innerLogical: arch.pleEmbedDim, bits: 4,
+                        groupSize: arch.groupSize, into: &tensors, rng: &rng)
+                }
+                appendUnquantizedBF16(name: prefix + ".ple.ple_embedding.layer_multipliers",
+                                      shape: [3], into: &tensors, rng: &rng)
+                appendUnquantizedBF16(name: prefix + ".ple.ple_embedding.ngram_heads_offsets",
+                                      shape: [2], into: &tensors, rng: &rng)
+                appendUnquantizedBF16(name: prefix + ".ple.ple_embedding.ngram_heads_vocab_sizes",
+                                      shape: [2], into: &tensors, rng: &rng)
+                appendQuantizedWeight(name: prefix + ".ple.key_proj",
+                                      outerShape: [arch.pleEmbedDim], innerLogical: arch.hidden,
+                                      bits: 4, groupSize: arch.groupSize, into: &tensors, rng: &rng)
+                appendQuantizedWeight(name: prefix + ".ple.value_proj",
+                                      outerShape: [arch.pleEmbedDim], innerLogical: arch.hidden,
+                                      bits: 4, groupSize: arch.groupSize, into: &tensors, rng: &rng)
+                appendUnquantizedBF16(name: prefix + ".ple.conv1d.weight",
+                                      shape: [arch.pleEmbedDim, 4, 1],
+                                      into: &tensors, rng: &rng)
+                appendUnquantizedBF16(name: prefix + ".ple.norm_conv.weight",
+                                      shape: [arch.pleEmbedDim], into: &tensors, rng: &rng)
+                appendUnquantizedBF16(name: prefix + ".ple.norm_key.weight",
+                                      shape: [arch.pleEmbedDim], into: &tensors, rng: &rng)
+                appendUnquantizedBF16(name: prefix + ".ple.norm_query.weight",
+                                      shape: [arch.pleEmbedDim], into: &tensors, rng: &rng)
+            }
+        }
+        // Final gated-residual mixer replaces `model.norm`.
+        appendUnquantizedBF16(name: "language_model.model.hyper_connection_mixer.hc_norm.weight",
+                              shape: [arch.hcHidden], into: &tensors, rng: &rng)
+        appendQuantizedWeight(name: "language_model.model.hyper_connection_mixer.input_mix_weight_down",
+                              outerShape: [arch.hcLowrank], innerLogical: arch.hcHidden,
+                              bits: 4, groupSize: arch.groupSize, into: &tensors, rng: &rng)
+        appendQuantizedWeight(name: "language_model.model.hyper_connection_mixer.input_mix_weight_up",
+                              outerShape: [arch.hcHidden], innerLogical: arch.hcLowrank,
+                              bits: 4, groupSize: arch.groupSize, into: &tensors, rng: &rng)
+
+        // Vision-tower tensors included to prove the text-only repacker drops them.
+        appendUnquantizedBF16(name: "vision_tower.blocks.0.norm1.weight",
+                              shape: [arch.hidden], into: &tensors, rng: &rng)
+        appendUnquantizedBF16(name: "vision_tower.patch_embed.proj.weight",
+                              shape: [arch.hidden, arch.hidden], into: &tensors, rng: &rng)
+
+        // -- Encode safetensors.
+        let shardName = "model-00001-of-00001.safetensors"
+        let shardPath = (dir as NSString).appendingPathComponent(shardName)
+        try writeShard(path: shardPath, tensors: tensors)
+
+        // -- Write config.json with 64-wide 8-bit overrides for the gates.
+        var quant: [String: Any] = [
+            "bits": 4, "group_size": arch.groupSize, "mode": "affine"
+        ]
+        for li in 0..<arch.numLayers {
+            let prefix = "language_model.model.layers.\(li)"
+            for k in ["mlp.gate", "mlp.shared_expert_gate"] {
+                quant[prefix + "." + k] = ["bits": 8, "group_size": arch.gateGroupSize]
+            }
+        }
+
+        let textConfig: [String: Any] = [
+            "hidden_size": arch.hidden,
+            "moe_intermediate_size": arch.moeIntermediate,
+            "shared_expert_intermediate_size": arch.sharedIntermediate,
+            "num_attention_heads": arch.numHeads,
+            "num_key_value_heads": arch.numKVHeads,
+            "head_dim": arch.headDim,
+            "vocab_size": arch.vocab,
+            "num_hidden_layers": arch.numLayers,
+            "num_experts": arch.numExperts,
+            "num_experts_per_tok": arch.topK,
+            "layer_types": arch.layerTypes,
+            "rope_parameters": [
+                "rope_theta": 10_000_000.0,
+                "rope_type": "default",
+                "partial_rotary_factor": 0.25
+            ],
+            "linear_num_key_heads": arch.linearNumKHeads,
+            "linear_num_value_heads": arch.linearNumVHeads,
+            "linear_key_head_dim": arch.linearKeyHeadDim,
+            "linear_value_head_dim": arch.linearValueHeadDim,
+            "linear_conv_kernel_dim": arch.linearConvKernelSize,
+            "tie_word_embeddings": false,
+            "hidden_act": "silu",
+            "hc_count": arch.hcCount,
+            "hc_lowrank": arch.hcLowrank,
+            "ple_embed_dim": arch.pleEmbedDim,
+            "ngram_size": 3,
+            "split_ngram_parts": arch.pleShards,
+            "heads_per_ngram": 8,
+            "indexer_budget": 2048,
+            "indexer_compress_ratio": 4,
+            "indexer_head_dim": arch.indexerHeadDim,
+            "indexer_kv_heads": arch.indexerKvHeads,
+            "indexer_n_heads": arch.indexerNHeads
+        ]
+        let config: [String: Any] = [
+            "architectures": ["Qwen4ExpForConditionalGeneration"],
+            "model_type": "qwen4_exp",
+            "quantization": quant,
+            "text_config": textConfig
+        ]
+        let configData = try JSONSerialization.data(withJSONObject: config, options: [.sortedKeys])
+        try configData.write(to: URL(fileURLWithPath: (dir as NSString).appendingPathComponent("config.json")))
+
+        // -- Write model.safetensors.index.json.
+        var weightMap: [String: String] = [:]
+        for (name, _, _, _) in tensors { weightMap[name] = shardName }
+        let indexObj: [String: Any] = [
+            "metadata": ["format": "mlx"],
+            "weight_map": weightMap
+        ]
+        let indexData = try JSONSerialization.data(withJSONObject: indexObj, options: [.sortedKeys])
+        let indexPath = (dir as NSString).appendingPathComponent("model.safetensors.index.json")
+        try indexData.write(to: URL(fileURLWithPath: indexPath))
+        return Snapshot(shardPath: shardPath)
+    }
+
     // MARK: - Tensor builders
 
     private static func appendQuantizedWeight(name: String,

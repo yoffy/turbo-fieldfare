@@ -43,6 +43,19 @@ public struct ManifestArch: Decodable, Equatable, Sendable {
     public let linearKeyHeadDim: Int?
     public let linearValueHeadDim: Int?
     public let linearConvKernelSize: Int?
+    // Qwen 3.8 extensions (gated residual, PLE, QSA indexer). Absent for
+    // older families.
+    public let hcCount: Int?
+    public let hcLowrank: Int?
+    public let pleEmbedDim: Int?
+    public let pleNgramSize: Int?
+    public let pleSplitParts: Int?
+    public let pleHeadsPerNgram: Int?
+    public let indexerBudget: Int?
+    public let indexerCompressRatio: Int?
+    public let indexerHeadDim: Int?
+    public let indexerKvHeads: Int?
+    public let indexerNHeads: Int?
 }
 
 public struct ManifestQuantSlot: Decodable, Equatable, Sendable {
@@ -74,6 +87,9 @@ public struct Manifest: Decodable, Equatable, Sendable {
     public let expertsPerLayer: Int
     public let numLayers: Int
     public let expertStride: UInt64
+    /// PLE n-gram shard count for qwen38 (`packed_ple/shard_*.bin`). Absent
+    /// (nil) for families without a PLE table.
+    public let pleShards: Int?
 }
 
 public enum ManifestReader {
@@ -165,6 +181,19 @@ public enum ManifestReader {
                 throw ModelError.missingFile(name: padded)
             }
         }
+        // Qwen 3.8 carries the PLE n-gram table as SSD-streamed shards.
+        if expected.family == .qwen38 {
+            guard let pleShards = m.pleShards, pleShards > 0 else {
+                throw ModelError.missingFile(name: "packed_ple/layout.json")
+            }
+            if m.files["packed_ple/layout.json"] == nil {
+                throw ModelError.missingFile(name: "packed_ple/layout.json")
+            }
+            for s in 0..<pleShards {
+                let name = String(format: "packed_ple/shard_%03d.bin", s)
+                if m.files[name] == nil { throw ModelError.missingFile(name: name) }
+            }
+        }
     }
 
     /// A manifest matching one of the shipped production baselines must carry
@@ -183,7 +212,7 @@ public enum ManifestReader {
         let slots: [(String, ManifestQuantSlot, Set<Int>)] = [
             ("embedding", quant.embedding, [4]),
             ("attention", quant.attention, [4]),
-            // Qwen 3.6 ships an 8-bit router; Qwen 3.5 ships a 4-bit router.
+            // Qwen 3.6 ships an 8-bit router; Qwen 3.5/3.8 ship a 4-bit router.
             ("router", quant.router, [4, 8]),
             ("sharedExpert", quant.sharedExpert, [4, 8]),
             ("routedExpert", quant.routedExpert, [4]),
@@ -193,7 +222,7 @@ public enum ManifestReader {
                   slot.scheme.lowercased() == "affine",
                   slot.scaleType.lowercased() == "bf16",
                   slot.biasType.lowercased() == "bf16",
-                  slot.groupSize == Quantization.groupSize else {
+                  slot.groupSize == 32 || slot.groupSize == Quantization.groupSize else {
                 throw ModelError.indexCorrupt(detail: "unsupported quantization for \(name)")
             }
         }
@@ -270,6 +299,28 @@ public enum ManifestReader {
                   a.linearValueHeadDim ?? 0, e.linearAttention.valueHeadDim)
         try check("linearConvKernelSize",
                   a.linearConvKernelSize ?? 0, e.linearAttention.convKernelSize)
+        try check("hcCount",
+                  a.hcCount ?? 0, e.hcCount)
+        try check("hcLowrank",
+                  a.hcLowrank ?? 0, e.hcLowrank)
+        try check("pleEmbedDim",
+                  a.pleEmbedDim ?? 0, e.pleEmbedDim)
+        try check("pleNgramSize",
+                  a.pleNgramSize ?? 0, e.pleNgramSize)
+        try check("pleSplitParts",
+                  a.pleSplitParts ?? 0, e.pleSplitParts)
+        try check("pleHeadsPerNgram",
+                  a.pleHeadsPerNgram ?? 0, e.pleHeadsPerNgram)
+        try check("indexerBudget",
+                  a.indexerBudget ?? 0, e.indexerBudget)
+        try check("indexerCompressRatio",
+                  a.indexerCompressRatio ?? 0, e.indexerCompressRatio)
+        try check("indexerHeadDim",
+                  a.indexerHeadDim ?? 0, e.indexerHeadDim)
+        try check("indexerKvHeads",
+                  a.indexerKvHeads ?? 0, e.indexerKvHeads)
+        try check("indexerNHeads",
+                  a.indexerNHeads ?? 0, e.indexerNHeads)
     }
 
     /// Decode just enough of `manifest.json` to identify the model family,

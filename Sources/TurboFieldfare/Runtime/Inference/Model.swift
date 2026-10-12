@@ -117,7 +117,7 @@ public struct Model {
         switch config.family {
         case .gemma4:
             return try resident(name: "language_model.model.layers.\(L).router.proj.weight")
-        case .qwen36, .qwen35:
+        case .qwen36, .qwen35, .qwen38:
             return try resident(name: "language_model.model.layers.\(L).mlp.gate.weight")
         }
     }
@@ -137,7 +137,7 @@ public struct Model {
         switch config.family {
         case .gemma4:
             return "language_model.model.layers.\(L).mlp.\(proj).weight"
-        case .qwen36, .qwen35:
+        case .qwen36, .qwen35, .qwen38:
             return "language_model.model.layers.\(L).mlp.shared_expert.\(proj).weight"
         }
     }
@@ -399,6 +399,13 @@ extension Model {
                             expertCachePolicy: ExpertCachePolicy = PreadExpertStreamer.cachePolicyDefault,
                             integrityPolicy: ModelIntegrityPolicy? = nil,
                             loadStats: UnsafeMutablePointer<ModelLoadStats>? = nil) throws -> Model {
+        // Qwen 3.8 repack/install support ships first; the QSA indexer,
+        // gated-residual mixing, and PLE lookup kernels are a follow-up
+        // inference PR. Refuse loudly instead of generating garbage.
+        if expecting.family == .qwen38 {
+            throw ModelError.indexCorrupt(
+                detail: "qwen38 inference is not implemented yet (QSA/gated-residual/PLE kernels pending)")
+        }
         var stats = ModelLoadStats()
         defer {
             loadStats?.pointee = stats

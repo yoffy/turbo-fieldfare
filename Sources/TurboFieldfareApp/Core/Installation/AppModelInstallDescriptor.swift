@@ -64,25 +64,37 @@ public struct AppModelInstallDescriptor: Equatable, Sendable {
         rangeStagingBytes: UInt64(RemoteChunkPolicy.defaultBytes),
         reserveBytes: 1_073_741_824)
 
+    public static let qwen38 = AppModelInstallDescriptor(
+        displayName: "Qwen3.8-Flash-Next 4-bit",
+        repoID: "mlx-community/Qwen3.8-Flash-Next-4bit",
+        revision: "07b5dc6c54600a359b87f1e53e7adf6351c72a2c",
+        sourceIndexSHA256: "3581f8d40a330d40009d0417359f5f75b7cf79e9f8fc48ba0b1461eabd43dd5f",
+        approximateDownloadBytes: 109_000_000_000,
+        installedBytes: 111_000_000_000,
+        rangeStagingBytes: UInt64(RemoteChunkPolicy.defaultBytes),
+        reserveBytes: 1_073_741_824)
+
     /// The shipped descriptor for a model family, if one exists.
     public static func descriptor(for family: ModelFamily) -> AppModelInstallDescriptor? {
         switch family {
         case .gemma4: return .default
         case .qwen36: return .qwen36
         case .qwen35: return .qwen35
+        case .qwen38: return .qwen38
         }
     }
 
     /// Basename of the installed `.gturbo` directory for this descriptor.
     public var installDirectoryName: String {
+        if self == .qwen38 { return "qwen38.gturbo" }
         if self == .qwen35 { return "qwen35.gturbo" }
         return self == .qwen36 ? "qwen36.gturbo" : "gemma4.gturbo"
     }
 
     /// The descriptor the app products select at launch. Defaults to Gemma 4.
-    /// `TURBO_FIELDFARE_MODEL=qwen35` (or `qwen36`) in the environment wins;
+    /// `TURBO_FIELDFARE_MODEL=qwen38` (or `qwen35`, `qwen36`) in the environment wins;
     /// otherwise the persisted preference
-    /// (`defaults write TurboFieldfare model qwen35`) applies, so GUI
+    /// (`defaults write TurboFieldfare model qwen38`) applies, so GUI
     /// launches without an environment also select the model.
     public static var selected: AppModelInstallDescriptor {
         let environmentValue = ProcessInfo.processInfo.environment["TURBO_FIELDFARE_MODEL"]
@@ -91,6 +103,7 @@ public struct AppModelInstallDescriptor: Equatable, Sendable {
         switch environmentValue ?? preferenceValue {
         case "qwen36": return .qwen36
         case "qwen35": return .qwen35
+        case "qwen38": return .qwen38
         default: return .default
         }
     }

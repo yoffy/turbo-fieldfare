@@ -9,6 +9,7 @@ public enum ModelFamily: String, Sendable, Equatable {
     case gemma4 = "gemma4"
     case qwen36 = "qwen36"
     case qwen35 = "qwen35"
+    case qwen38 = "qwen38"
 }
 
 /// Gated-DeltaNet (linear attention) dimensions. Zeroed for architectures
@@ -96,6 +97,22 @@ public struct ArchConfig: Sendable, Equatable {
     public let ropeNeoxSubdim: Bool
     /// Gated-DeltaNet dimensions for layers with mask value 2.
     public let linearAttention: LinearAttentionConfig
+    /// Gated-residual (hyper-connection) branch count and bottleneck rank.
+    /// Zero for architectures without hyper-connections.
+    public let hcCount: Int
+    public let hcLowrank: Int
+    /// PLE n-gram table geometry (Qwen 3.8 layer 1). Zero when absent.
+    public let pleEmbedDim: Int
+    public let pleNgramSize: Int
+    public let pleSplitParts: Int
+    public let pleHeadsPerNgram: Int
+    /// QSA indexer geometry for layers with mask value 1 under qwen38.
+    /// Zero when absent.
+    public let indexerBudget: Int
+    public let indexerCompressRatio: Int
+    public let indexerHeadDim: Int
+    public let indexerKvHeads: Int
+    public let indexerNHeads: Int
 
     public init(
         hiddenSize: Int,
@@ -127,7 +144,18 @@ public struct ArchConfig: Sendable, Equatable {
         ffnSandwichNorms: Bool = true,
         sharedExpertGated: Bool = false,
         ropeNeoxSubdim: Bool = false,
-        linearAttention: LinearAttentionConfig = .none
+        linearAttention: LinearAttentionConfig = .none,
+        hcCount: Int = 0,
+        hcLowrank: Int = 0,
+        pleEmbedDim: Int = 0,
+        pleNgramSize: Int = 0,
+        pleSplitParts: Int = 0,
+        pleHeadsPerNgram: Int = 0,
+        indexerBudget: Int = 0,
+        indexerCompressRatio: Int = 0,
+        indexerHeadDim: Int = 0,
+        indexerKvHeads: Int = 0,
+        indexerNHeads: Int = 0
     ) {
         self.hiddenSize = hiddenSize
         self.intermediateSize = intermediateSize
@@ -159,6 +187,17 @@ public struct ArchConfig: Sendable, Equatable {
         self.sharedExpertGated = sharedExpertGated
         self.ropeNeoxSubdim = ropeNeoxSubdim
         self.linearAttention = linearAttention
+        self.hcCount = hcCount
+        self.hcLowrank = hcLowrank
+        self.pleEmbedDim = pleEmbedDim
+        self.pleNgramSize = pleNgramSize
+        self.pleSplitParts = pleSplitParts
+        self.pleHeadsPerNgram = pleHeadsPerNgram
+        self.indexerBudget = indexerBudget
+        self.indexerCompressRatio = indexerCompressRatio
+        self.indexerHeadDim = indexerHeadDim
+        self.indexerKvHeads = indexerKvHeads
+        self.indexerNHeads = indexerNHeads
     }
 
     /// Canonical Gemma 4 26B-A4B baseline, checked against the installed
@@ -297,11 +336,75 @@ public struct ArchConfig: Sendable, Equatable {
         return mask
     }
 
+    /// Canonical Qwen3.8-Flash-Next baseline: 48 layers / hidden 2560 with
+    /// the same 3-linear + 1-full motif, but the full layers use QSA sparse
+    /// attention (indexer below), every sub-layer is wrapped in a 4-branch
+    /// gated residual, and layer index 1 carries the PLE n-gram table
+    /// (installed under `packed_ple/`, streamed from SSD like experts).
+    /// 512 routed experts (top-10) plus a sigmoid-gated shared expert.
+    /// Repack-only for now: the QSA indexer, gated-residual mixing, and PLE
+    /// lookup kernels are not implemented yet, so the runner must refuse to
+    /// generate with this family until the inference PR lands.
+    public static let qwen38_FlashNext = ArchConfig(
+        hiddenSize: 2560,
+        intermediateSize: 640,
+        moeIntermediateSize: 640,
+        numHeads: 24,
+        numKVHeads: 2,
+        numFullKVHeads: 2,
+        headDim: 256,
+        fullHeadDim: 256,
+        vocabSize: 248_320,
+        slidingWindow: 0,
+        finalLogitSoftcap: 0.0,
+        ropeTheta: 10_000_000.0,
+        fullRopeTheta: 10_000_000.0,
+        partialRotaryFactor: 0.25,
+        numLayers: 48,
+        numExperts: 512,
+        topKExperts: 10,
+        tieWordEmbeddings: false,
+        attentionKEqV: false,
+        fullAttentionLayerMask: Self.qwen38LayerMask(),
+        hiddenActivation: "silu",
+        family: .qwen38,
+        attnOutputGate: true,
+        attentionScale: 0.0625,   // 256^-0.5
+        embeddingScaledBySqrtHidden: false,
+        routerScaled: false,
+        ffnSandwichNorms: false,
+        sharedExpertGated: true,
+        ropeNeoxSubdim: true,
+        linearAttention: LinearAttentionConfig(
+            numKHeads: 16, numVHeads: 48,
+            keyHeadDim: 128, valueHeadDim: 128,
+            convKernelSize: 4),
+        hcCount: 4,
+        hcLowrank: 320,
+        pleEmbedDim: 2560,
+        pleNgramSize: 3,
+        pleSplitParts: 128,
+        pleHeadsPerNgram: 8,
+        indexerBudget: 2048,
+        indexerCompressRatio: 4,
+        indexerHeadDim: 128,
+        indexerKvHeads: 1,
+        indexerNHeads: 4
+    )
+
+    private static func qwen38LayerMask() -> [UInt8] {
+        // Same 3-linear + 1-QSA motif, 48 layers (QSA on every 4th layer).
+        var mask = [UInt8](repeating: 2, count: 48)
+        for i in stride(from: 3, to: 48, by: 4) { mask[i] = 1 }
+        return mask
+    }
+
     /// Registry keyed by `manifest.arch.family` for auto-detection at load.
     public static let knownArchitectures: [ModelFamily: ArchConfig] = [
         .gemma4: .gemma4_26B_A4B,
         .qwen36: .qwen36_35B_A3B,
         .qwen35: .qwen35_122B_A10B,
+        .qwen38: .qwen38_FlashNext,
     ]
 
     /// Resident INT4 GEMV shapes this architecture issues during decode, for

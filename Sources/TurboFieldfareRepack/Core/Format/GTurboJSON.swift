@@ -20,6 +20,13 @@ enum GTurboJSON {
         var router: Int
         var sharedExpert: Int
         var routedExpert: Int
+        /// Per-slot row-group widths. Older checkpoints are uniformly 64;
+        /// Qwen 3.8 mixes a 32-wide base with 64-wide gate overrides.
+        var embeddingGroup: Int = 64
+        var attentionGroup: Int = 64
+        var routerGroup: Int = 64
+        var sharedExpertGroup: Int = 64
+        var routedExpertGroup: Int = 64
     }
 
     static func encodeManifest(plan: RepackPlan,
@@ -72,21 +79,34 @@ enum GTurboJSON {
             archDict["linearValueHeadDim"] = arch.linearValueHeadDim
             archDict["linearConvKernelSize"] = arch.linearConvKernelSize
         }
-        let quantBits = [
-            "embedding": bitWidths.embedding,
-            "attention": bitWidths.attention,
-            "router": bitWidths.router,
-            "sharedExpert": bitWidths.sharedExpert,
-            "routedExpert": bitWidths.routedExpert,
+        if arch.family == .qwen38 {
+            archDict["hcCount"] = arch.hcCount
+            archDict["hcLowrank"] = arch.hcLowrank
+            archDict["pleEmbedDim"] = arch.pleEmbedDim
+            archDict["pleNgramSize"] = arch.pleNgramSize
+            archDict["pleSplitParts"] = arch.pleSplitParts
+            archDict["pleHeadsPerNgram"] = arch.pleHeadsPerNgram
+            archDict["indexerBudget"] = arch.indexerBudget
+            archDict["indexerCompressRatio"] = arch.indexerCompressRatio
+            archDict["indexerHeadDim"] = arch.indexerHeadDim
+            archDict["indexerKvHeads"] = arch.indexerKvHeads
+            archDict["indexerNHeads"] = arch.indexerNHeads
+        }
+        let quantBits: [(String, Int, Int)] = [
+            ("embedding", bitWidths.embedding, bitWidths.embeddingGroup),
+            ("attention", bitWidths.attention, bitWidths.attentionGroup),
+            ("router", bitWidths.router, bitWidths.routerGroup),
+            ("sharedExpert", bitWidths.sharedExpert, bitWidths.sharedExpertGroup),
+            ("routedExpert", bitWidths.routedExpert, bitWidths.routedExpertGroup),
         ]
         var quantDict: [String: Any] = [:]
-        for (slot, bits) in quantBits {
+        for (slot, bits, group) in quantBits {
             quantDict[slot] = [
                 "weightBits": bits,
                 "scheme": plan.baseMode,
                 "scaleType": "BF16",
                 "biasType": "BF16",
-                "groupSize": plan.baseGroupSize
+                "groupSize": group
             ]
         }
 
@@ -95,7 +115,7 @@ enum GTurboJSON {
             filesDict[path] = ["size": info.size, "sha256": info.sha256]
         }
 
-        let manifest: [String: Any] = [
+        var manifest: [String: Any] = [
             "magic": GTurboJSON.magic,
             "versionMajor": GTurboJSON.versionMajor,
             "versionMinor": GTurboJSON.versionMinor,
@@ -114,6 +134,11 @@ enum GTurboJSON {
             "expertStride": expertStride,
             "bitWidthOverridesHonored": plan.bitsOverrideCount
         ]
+        // Only qwen38 installs carry PLE shards; older manifests stay
+        // byte-identical to the pre-PLE format.
+        if !plan.pleShards.isEmpty {
+            manifest["pleShards"] = plan.pleShards.count
+        }
         return try JSONSerialization.data(withJSONObject: manifest,
             options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
     }
@@ -166,6 +191,37 @@ enum GTurboJSON {
             "numLayers": arch.numLayers,
             "expertsPerLayer": plan.layers.first?.expertsPerLayer ?? 0,
             "layers": layersArr
+        ]
+        return try JSONSerialization.data(withJSONObject: obj,
+            options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+    }
+
+    /// Encodes `packed_ple/layout.json`: one entry per SSD-streamed PLE
+    /// n-gram shard. Each shard file holds the quantized weight bytes
+    /// followed by BF16 scales then biases; the runtime PLE streamer (a
+    /// later inference PR) addresses shards through this index.
+    static func encodePleLayout(plan: RepackPlan) throws -> Data {
+        var shardsArr: [[String: Any]] = []
+        shardsArr.reserveCapacity(plan.pleShards.count)
+        for shard in plan.pleShards {
+            shardsArr.append([
+                "shard": shard.shardIndex,
+                "file": (shard.path as NSString).lastPathComponent,
+                "weightOffset": 0,
+                "weightSize": shard.weightBytes,
+                "scalesOffset": shard.weightBytes,
+                "scalesSize": shard.scalesBytes,
+                "biasesOffset": shard.weightBytes + shard.scalesBytes,
+                "biasesSize": shard.biasesBytes,
+                "logicalShape": shard.logicalShape.map { Int($0) },
+                "bits": shard.bits,
+                "groupSize": shard.groupSize,
+            ])
+        }
+        let obj: [String: Any] = [
+            "layer": plan.pleShards.first?.layerIndex ?? 0,
+            "shardCount": plan.pleShards.count,
+            "shards": shardsArr
         ]
         return try JSONSerialization.data(withJSONObject: obj,
             options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])

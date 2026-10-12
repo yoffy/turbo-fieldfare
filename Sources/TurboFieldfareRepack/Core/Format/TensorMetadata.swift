@@ -24,6 +24,15 @@ struct SourceTensor: Sendable, Hashable {
 }
 
 /// Bit-width override resolved from `config.json -> quantization`.
+/// `groupSize` records the row-group the scales/biases were quantized with.
+/// Qwen 3.8 mixes a 32-wide base with 64-wide gate overrides; older
+/// checkpoints are uniformly 64-wide.
 struct QuantSpec: Sendable, Hashable {
     let bits: Int
+    let groupSize: Int
+
+    init(bits: Int, groupSize: Int = 64) {
+        self.bits = bits
+        self.groupSize = groupSize
+    }
 }

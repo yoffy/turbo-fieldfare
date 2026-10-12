@@ -60,12 +60,17 @@ enum IndexLoader {
                 guard let entry = v as? [String: Any] else { continue }
                 let bits = (entry["bits"] as? Int) ?? baseBits
                 let g    = (entry["group_size"] as? Int) ?? baseGroup
-                guard g == baseGroup else {
+                // Qwen 3.8 mixes a 32-wide base with 64-wide gate overrides
+                // (`mlp.gate`, `mlp.shared_expert_gate`, PLE shards stay 32).
+                // The per-tensor group travels in `QuantSpec` and is recorded
+                // per manifest quant slot; the runtime kernels that consume a
+                // given slot must honor it.
+                guard g == baseGroup || baseGroup == 32 else {
                     throw RepackError.configJsonInvalid(
                         path: configPath,
                         detail: "quantization override \(k) group_size \(g) != base \(baseGroup)")
                 }
-                overrides[k] = QuantSpec(bits: bits)
+                overrides[k] = QuantSpec(bits: bits, groupSize: g)
             }
         } catch let e as RepackError {
             throw e
@@ -96,6 +101,6 @@ enum IndexLoader {
             ? String(name.dropLast(".weight".count))
             : name
         if let o = meta.bitsOverrides[stripped] { return o }
-        return QuantSpec(bits: meta.baseBits)
+        return QuantSpec(bits: meta.baseBits, groupSize: meta.baseGroupSize)
     }
 }

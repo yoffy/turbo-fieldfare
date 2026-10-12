@@ -84,22 +84,46 @@ struct LayerFilePlan: Sendable {
 struct RepackPlan: Sendable {
     let arch: ArchInfo
     let baseMode: String                  // "affine"
-    let baseGroupSize: Int                // 64
+    let baseGroupSize: Int                // 64 (32 for qwen38)
     let bitsOverrideCount: Int
     let resident: ResidentFilePlan
     let layers: [LayerFilePlan]
     let matchedModelID: String?
     let excludedMultimodalTensorNames: [String]
+    /// SSD-streamed PLE n-gram shards (qwen38 only; empty otherwise).
+    /// Each shard is one file under `packed_ple/` holding the quantized
+    /// weight bytes followed by BF16 scales then biases.
+    let pleShards: [PleShardPlan]
+}
+
+/// One SSD-streamed PLE n-gram embedding shard.
+struct PleShardPlan: Sendable {
+    let layerIndex: Int
+    let shardIndex: Int
+    let path: String
+    let weightBytes: UInt64
+    let scalesBytes: UInt64
+    let biasesBytes: UInt64
+    var fileSize: UInt64 { weightBytes + scalesBytes + biasesBytes }
+    /// Logical (dequantized) shape of the shard weight.
+    let logicalShape: [UInt64]
+    let bits: Int
+    let groupSize: Int
+    let sourceWeight: SourceTensor
+    let sourceScales: SourceTensor
+    let sourceBiases: SourceTensor
 }
 
 // MARK: - Planner
 
 enum RepackPlanner {
 
-    /// Classify a tensor name. Routed-expert tensors split off the LM bucket.
+    /// Classify a tensor name. Routed-expert tensors split off the LM bucket;
+    /// qwen38 PLE n-gram shards split into their own SSD-streamed bucket.
     enum Bucket: Equatable {
         case lmResident
         case routedExpert(role: String, layer: Int)   // role = "gate"|"up"|"down"
+        case pleShard(layer: Int, shard: Int)
         case excludedMultimodal
         case unknown
     }
@@ -107,6 +131,12 @@ enum RepackPlanner {
     static func classify(_ name: String, numLayers: Int,
                          family: RepackModelFamily) -> Bucket {
         if name.hasPrefix("language_model.") {
+            // PLE n-gram shards stream from SSD, never resident.
+            if family == .qwen38,
+               let (layer, shard) = pleShardIndices(in: name),
+               layer >= 0 && layer < numLayers {
+                return .pleShard(layer: layer, shard: shard)
+            }
             // Routed expert?
             if let role = routedExpertRole(in: name, family: family),
                let layer = layerIndex(in: name),
@@ -126,13 +156,24 @@ enum RepackPlanner {
         let routedContainer: String
         switch family {
         case .gemma4: routedContainer = ".experts.switch_glu."
-        case .qwen36, .qwen35: routedContainer = ".mlp.switch_mlp."
+        case .qwen36, .qwen35, .qwen38: routedContainer = ".mlp.switch_mlp."
         }
         guard name.contains(routedContainer) else { return nil }
         if name.contains(".gate_proj.") { return "gate" }
         if name.contains(".up_proj.")   { return "up" }
         if name.contains(".down_proj.") { return "down" }
         return nil
+    }
+
+    /// Parses `...layers.<L>.ple.ple_embedding.ngram_embedding.shards.<S>.{weight,scales,biases}`.
+    private static func pleShardIndices(in name: String) -> (Int, Int)? {
+        guard name.contains(".ple.ple_embedding.ngram_embedding.shards.") else { return nil }
+        guard let layer = layerIndex(in: name) else { return nil }
+        guard let r = name.range(of: ".shards.") else { return nil }
+        let tail = name[r.upperBound...]
+        guard let dot = tail.firstIndex(of: ".") else { return nil }
+        guard let shard = Int(tail[tail.startIndex..<dot]) else { return nil }
+        return (layer, shard)
     }
 
     private static func layerIndex(in name: String) -> Int? {
@@ -165,6 +206,7 @@ enum RepackPlanner {
         var lmResidentBases: [String] = []
         var excludedMultimodalNames: [String] = []
         var routedByLayerAndRole: [Int: [String: String]] = [:]
+        var pleByLayerAndShard: [Int: [Int: String]] = [:]
         for (name, _) in registry {
             if isMultimodalTensorName(name) {
                 excludedMultimodalNames.append(name)
@@ -181,6 +223,14 @@ enum RepackPlanner {
                 }
                 byRole[role] = name
                 routedByLayerAndRole[layer] = byRole
+            case .pleShard(let layer, let shard):
+                var byShard = pleByLayerAndShard[layer] ?? [:]
+                if byShard[shard] != nil {
+                    throw RepackError.configurationInvalid(detail:
+                        "two PLE shard tensors for layer \(layer) shard \(shard)")
+                }
+                byShard[shard] = name
+                pleByLayerAndShard[layer] = byShard
             case .excludedMultimodal:           continue
             case .unknown:                      throw RepackError.unknownTensorPrefix(name: name)
             }
@@ -223,6 +273,20 @@ enum RepackPlanner {
 
         let matched = SourceFingerprint.modelID(forIndexSha256: meta.indexSha256Hex)
 
+        var pleShards: [PleShardPlan] = []
+        let pleDir = (outputDir as NSString).appendingPathComponent("packed_ple")
+        for layer in pleByLayerAndShard.keys.sorted() {
+            for shard in (pleByLayerAndShard[layer] ?? [:]).keys.sorted() {
+                let base = pleByLayerAndShard[layer]![shard]!
+                let path = (pleDir as NSString)
+                    .appendingPathComponent("shard_\(String(format: "%03d", shard)).bin")
+                pleShards.append(try planPleShard(
+                    path: path,
+                    layer: layer, shard: shard, baseName: base,
+                    registry: registry, meta: meta))
+            }
+        }
+
         return RepackPlan(arch: arch,
                           baseMode: meta.baseMode,
                           baseGroupSize: meta.baseGroupSize,
@@ -230,7 +294,8 @@ enum RepackPlanner {
                           resident: resident,
                           layers: layerPlans,
                           matchedModelID: matched,
-                          excludedMultimodalTensorNames: excludedMultimodalNames)
+                          excludedMultimodalTensorNames: excludedMultimodalNames,
+                          pleShards: pleShards)
     }
 
     private static func isMultimodalTensorName(_ name: String) -> Bool {
@@ -409,6 +474,43 @@ enum RepackPlanner {
                              subTensors: subs)
     }
 
+    /// Plans one SSD-streamed PLE n-gram shard file. The file holds the
+    /// quantized weight bytes followed by BF16 scales then biases; the
+    /// companion shapes must tile the shard's row groups exactly.
+    private static func planPleShard(path: String, layer: Int, shard: Int,
+                                     baseName: String,
+                                     registry: [String: SourceTensor],
+                                     meta: IndexLoader.SourceMetadata) throws -> PleShardPlan {
+        let weightName = baseName.hasSuffix(".weight") ? baseName : baseName + ".weight"
+        guard let w = registry[weightName] else { throw RepackError.missingTensor(name: weightName) }
+        guard w.dtype == .u32 else {
+            throw RepackError.shapeMismatch(name: weightName,
+                detail: "expected U32 packed PLE shard, got \(w.dtype)")
+        }
+        let base = String(weightName.dropLast(".weight".count))
+        guard let s = registry[base + ".scales"] else { throw RepackError.missingScalesCompanion(name: weightName) }
+        guard let b = registry[base + ".biases"] else { throw RepackError.missingBiasesCompanion(name: weightName) }
+        if s.dtype != .bf16 || b.dtype != .bf16 {
+            throw RepackError.dtypeMismatch(name: weightName,
+                detail: "expected BF16 scales/biases, got \(s.dtype)/\(b.dtype)")
+        }
+        let spec = IndexLoader.quantSpec(forTensor: weightName, meta: meta)
+        let logical = logicalShape(forPackedSource: w.shape, bits: spec.bits)
+        return PleShardPlan(
+            layerIndex: layer,
+            shardIndex: shard,
+            path: path,
+            weightBytes: w.sizeBytes,
+            scalesBytes: s.sizeBytes,
+            biasesBytes: b.sizeBytes,
+            logicalShape: logical,
+            bits: spec.bits,
+            groupSize: spec.groupSize,
+            sourceWeight: w,
+            sourceScales: s,
+            sourceBiases: b)
+    }
+
     // MARK: - Helpers
 
     private static func ietnyDtype(_ d: SourceTensor.Dtype) -> UInt8 {
@@ -445,6 +547,9 @@ enum RepackPlanner {
         // Compute a sort key per name; we order by (group rank, layer, slot rank, name).
         func key(_ n: String) -> (Int, Int, Int, String) {
             if n == "language_model.model.embed_tokens.weight" { return (0, 0, 0, n) }
+            if n == "language_model.model.hyper_connection_mixer.hc_norm.weight" { return (3, 0, 0, n) }
+            if n == "language_model.model.hyper_connection_mixer.input_mix_weight_down.weight" { return (3, 0, 1, n) }
+            if n == "language_model.model.hyper_connection_mixer.input_mix_weight_up.weight" { return (3, 0, 2, n) }
             if n == "language_model.model.norm.weight"          { return (3, 0, 0, n) }
             if n == "language_model.lm_head.weight"             { return (4, 0, 0, n) }
             if let li = layerIndex(in: n) {
@@ -452,6 +557,7 @@ enum RepackPlanner {
                 switch family {
                 case .gemma4: slot = slotRank(in: n)
                 case .qwen36, .qwen35: slot = qwenSlotRank(in: n)
+                case .qwen38: slot = qwen38SlotRank(in: n)
                 }
                 return (1, li, slot, n)
             }
@@ -492,6 +598,57 @@ enum RepackPlanner {
         if n.contains(".mlp.shared_expert.down_proj.weight") { return 19 }
         if n.hasSuffix(".input_layernorm.weight")        { return 20 }
         if n.hasSuffix(".post_attention_layernorm.weight") { return 21 }
+        return 100
+    }
+
+    /// Within-layer slot order for the Qwen 3.8 family: QSA/full-attention
+    /// projections plus the indexer bundle, then the gated-DeltaNet bundle,
+    /// then router, shared-expert gate and MLP, then the per-sub-layer
+    /// gated-residual (hyper-connection) weights, then the PLE projections
+    /// (layer 1 only). There are no classic layer norms: the residual stream
+    /// is carried by the hyper-connections and closed by
+    /// `hyper_connection_mixer`.
+    private static func qwen38SlotRank(in n: String) -> Int {
+        if n.contains(".self_attn.q_proj.weight")   { return 0 }
+        if n.contains(".self_attn.k_proj.weight")   { return 1 }
+        if n.contains(".self_attn.v_proj.weight")   { return 2 }
+        if n.contains(".self_attn.o_proj.weight")   { return 3 }
+        if n.contains(".self_attn.q_norm.weight")   { return 4 }
+        if n.contains(".self_attn.k_norm.weight")   { return 5 }
+        if n.contains(".self_attn.indexer.index_qk_proj.weight") { return 6 }
+        if n.contains(".self_attn.indexer.q_layernorm.weight")   { return 7 }
+        if n.contains(".self_attn.indexer.k_layernorm.weight")   { return 8 }
+        if n.contains(".linear_attn.in_proj_qkv.weight") { return 9 }
+        if n.contains(".linear_attn.in_proj_z.weight")   { return 10 }
+        if n.contains(".linear_attn.in_proj_a.weight")   { return 11 }
+        if n.contains(".linear_attn.in_proj_b.weight")   { return 12 }
+        if n.contains(".linear_attn.conv1d.weight")      { return 13 }
+        if n.hasSuffix(".linear_attn.A_log")             { return 14 }
+        if n.hasSuffix(".linear_attn.dt_bias")           { return 15 }
+        if n.contains(".linear_attn.norm.weight")        { return 16 }
+        if n.contains(".linear_attn.out_proj.weight")    { return 17 }
+        if n.contains(".mlp.gate.weight")                { return 18 }
+        if n.contains(".mlp.shared_expert_gate.weight")  { return 19 }
+        if n.contains(".mlp.shared_expert.gate_proj.weight") { return 20 }
+        if n.contains(".mlp.shared_expert.up_proj.weight")   { return 21 }
+        if n.contains(".mlp.shared_expert.down_proj.weight") { return 22 }
+        if n.contains(".attn_hyper_connection.hc_norm.weight") { return 23 }
+        if n.contains(".attn_hyper_connection.input_mix_weight_down.weight") { return 24 }
+        if n.contains(".attn_hyper_connection.input_mix_weight_up.weight")   { return 25 }
+        if n.contains(".attn_hyper_connection.block_inject_weight.weight")   { return 26 }
+        if n.contains(".mlp_hyper_connection.hc_norm.weight") { return 27 }
+        if n.contains(".mlp_hyper_connection.input_mix_weight_down.weight") { return 28 }
+        if n.contains(".mlp_hyper_connection.input_mix_weight_up.weight")   { return 29 }
+        if n.contains(".mlp_hyper_connection.block_inject_weight.weight")   { return 30 }
+        if n.hasSuffix(".ple_embedding.layer_multipliers") { return 31 }
+        if n.hasSuffix(".ple_embedding.ngram_heads_offsets") { return 32 }
+        if n.hasSuffix(".ple_embedding.ngram_heads_vocab_sizes") { return 33 }
+        if n.contains(".ple.key_proj.weight")   { return 34 }
+        if n.contains(".ple.value_proj.weight") { return 35 }
+        if n.contains(".ple.conv1d.weight")     { return 36 }
+        if n.contains(".ple.norm_conv.weight")  { return 37 }
+        if n.contains(".ple.norm_key.weight")   { return 38 }
+        if n.contains(".ple.norm_query.weight") { return 39 }
         return 100
     }
 

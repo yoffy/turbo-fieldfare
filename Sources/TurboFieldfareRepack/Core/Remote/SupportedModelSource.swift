@@ -77,10 +77,29 @@ public struct SupportedModelSource: Sendable, Equatable {
         installedBytes: 68_739_047_424,
         reserveBytes: 1_073_741_824)
 
+    /// Qwen3.8-Flash-Next: 48 layers / hidden 2560 with QSA sparse attention,
+    /// per-sublayer gated residuals, and a 51B PLE n-gram table (installed
+    /// under `packed_ple/` for SSD streaming). Like the other Qwen sources,
+    /// only the `language_model.*` tensors plus tokenizer/metadata sidecars
+    /// are fetched; the vision tower and MTP head are excluded. Sizes are
+    /// estimates from the upstream `usedStorage` (~111.5 GB for all 22
+    /// shards); refine after the first real install.
+    public static let qwen38 = SupportedModelSource(
+        name: "qwen38",
+        displayName: "Qwen3.8-Flash-Next 4-bit",
+        repoID: "mlx-community/Qwen3.8-Flash-Next-4bit",
+        revision: "07b5dc6c54600a359b87f1e53e7adf6351c72a2c",
+        sourceIndexSHA256:
+            "3581f8d40a330d40009d0417359f5f75b7cf79e9f8fc48ba0b1461eabd43dd5f",
+        modelID: "qwen3.8-flash-next-4bit",
+        approximateDownloadBytes: 109_000_000_000,
+        installedBytes: 111_000_000_000,
+        reserveBytes: 1_073_741_824)
+
     /// Default source when no `--model` selector is given.
     public static let `default` = gemma4
 
-    public static let all: [SupportedModelSource] = [gemma4, qwen36, qwen35]
+    public static let all: [SupportedModelSource] = [gemma4, qwen36, qwen35, qwen38]
 
     public static func named(_ name: String) -> SupportedModelSource? {
         all.first { $0.name == name }
