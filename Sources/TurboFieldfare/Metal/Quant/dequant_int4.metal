@@ -126,6 +126,9 @@ static inline void dequant_int4_gemv_simd_body(
         // path. Fast blocks cover 8 groups per 128-byte chunk (4 lanes per
         // group, 8 contiguous elements each); the remainder covers one
         // element per lane. Same affine factoring as the 64-wide path.
+        // NOTE: `acc` is declared locally here because the shared 64-wide
+        // accumulator lives below this early-return block.
+        float acc32 = 0.0f;
         const uint n_groups32  = N / 32u;
         const uint row_bytes32 = N / 2;
         device const uint8_t* W_row32 = W      + uint(row) * row_bytes32;
@@ -154,8 +157,8 @@ static inline void dequant_int4_gemv_simd_body(
             dot = fma(float(b2 & 0x0Fu), e4, dot); dot = fma(float(b2 >> 4), e5, dot);
             dot = fma(float(b3 & 0x0Fu), e6, dot); dot = fma(float(b3 >> 4), e7, dot);
             const float sum = e0 + e1 + e2 + e3 + e4 + e5 + e6 + e7;
-            acc = fma(s, dot, acc);
-            acc = fma(b, sum, acc);
+            acc32 = fma(s, dot, acc32);
+            acc32 = fma(b, sum, acc32);
         }
         for (uint g = full_blocks32 * 8u; g < n_groups32; ++g) {
             const float s = float(s_row32[g]);
@@ -163,12 +166,12 @@ static inline void dequant_int4_gemv_simd_body(
             const uint8_t byte = W_row32[g * 16u + (lane >> 1)];
             const uint q = (lane & 1u) ? uint(byte >> 4) : uint(byte & 0x0Fu);
             const float xv = float(x[g * 32u + lane]);
-            acc = fma(s, float(q) * xv, acc);
-            acc = fma(b, xv, acc);
+            acc32 = fma(s, float(q) * xv, acc32);
+            acc32 = fma(b, xv, acc32);
         }
-        acc = simd_sum(acc);
+        acc32 = simd_sum(acc32);
         if (lane == 0) {
-            y[row] = half(acc);
+            y[row] = half(acc32);
         }
         return;
     }

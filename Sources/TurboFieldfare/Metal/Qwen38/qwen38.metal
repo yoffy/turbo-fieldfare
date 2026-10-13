@@ -268,7 +268,7 @@ kernel void ple_short_conv_step(
     device const bfloat* weight [[buffer(2)]], // [C, K] BF16
     device half*       out    [[buffer(3)]],   // [C] FP16
     constant uint&     channels [[buffer(4)]],
-    constant uint&     kernel [[buffer(5)]],
+    constant uint&     kernelSize [[buffer(5)]],
     constant uint&     dilation [[buffer(6)]],
     constant uint&     stateLen [[buffer(7)]],
     uint c [[thread_position_in_grid]]
@@ -276,7 +276,7 @@ kernel void ple_short_conv_step(
     if (c >= channels) return;
     // Gather taps from [state | input].
     float acc = 0.0f;
-    for (uint t = 0; t < kernel; ++t) {
+    for (uint t = 0; t < kernelSize; ++t) {
         uint back = t * dilation;
         float v;
         if (back == 0) {
@@ -286,7 +286,7 @@ kernel void ple_short_conv_step(
             // by construction ((K-1)*dilation == stateLen).
             v = float(state[(stateLen - back) * channels + c]);
         }
-        acc = fma(float(weight[c * kernel + t]), v, acc);
+        acc = fma(float(weight[c * kernelSize + t]), v, acc);
     }
     float s = acc / (1.0f + exp(-acc));
     out[c] = half(s);
