@@ -96,7 +96,7 @@ import Foundation
         #expect(m1 == [3352040966061, 19752442147475, 10742103100073])
         #expect(Qwen38Reference.isPrime(20000003))
         #expect(!Qwen38Reference.isPrime(20000000))
-        #expect(Qwen38Reference.nthPrimeAfter(20000000 - 1, 1) == 20000003)
+        #expect(Qwen38Reference.nthPrimeAfter(20000000 - 1, count: 1) == 20000003)
     }
 
     @Test func ngramGeometryIsConsistent() {

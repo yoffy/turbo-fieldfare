@@ -2590,11 +2590,11 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         q38.encodeSigmoid(commandBuffer: cb, x: mix, y: mix, count: hcHidden)
         q38.encodeMixMean(commandBuffer: cb, mix: mix, normed: hyperNormed,
                           mixed: mixedOut, d: D, h: hc)
-        if let injW, let injOut {
+        if let injectW, let injOut {
             int4.encode(commandBuffer: cb,
-                        weights: injW.buffer, weightsOffset: Int(injW.offset),
-                        scales: injW.buffer, scalesOffset: Int(injW.scaleOffset),
-                        biases: injW.buffer, biasesOffset: Int(injW.biasOffset),
+                        weights: injectW.buffer, weightsOffset: Int(injectW.offset),
+                        scales: injectW.buffer, scalesOffset: Int(injectW.scaleOffset),
+                        biases: injectW.buffer, biasesOffset: Int(injectW.biasOffset),
                         x: hyperNormed, y: injOut,
                         m: UInt32(hc), n: UInt32(hcHidden),
                         groupSize: groupSize)

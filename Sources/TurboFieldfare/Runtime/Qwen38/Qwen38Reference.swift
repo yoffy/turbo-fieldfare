@@ -350,7 +350,7 @@ public enum Qwen38Reference {
         var total = 0
         for head in 0..<ngramHeads {
             let globalHead = pleLayerIndex * ngramHeads + head
-            let size = nthPrimeAfter(vocabBase - 1, globalHead + 1)
+            let size = nthPrimeAfter(vocabBase - 1, count: globalHead + 1)
             sizes.append(size)
             offsets.append(total)
             total += size
