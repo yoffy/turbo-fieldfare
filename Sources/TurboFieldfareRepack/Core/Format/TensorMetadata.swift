@@ -9,9 +9,16 @@ struct SourceTensor: Sendable, Hashable {
         case bf16 = 1
         case fp16 = 2
         case fp32 = 3
+        /// Qwen 3.8 PLE metadata (`layer_multipliers`, `ngram_heads_offsets`,
+        /// `ngram_heads_vocab_sizes`): small unquantized integer tables kept
+        /// resident. Copied verbatim; consumed by the PLE streamer.
+        case i64  = 4
 
         var elementBytes: Int {
-            switch self { case .u32: 4; case .bf16: 2; case .fp16: 2; case .fp32: 4 }
+            switch self {
+            case .u32: 4; case .bf16: 2; case .fp16: 2; case .fp32: 4
+            case .i64: 8
+            }
         }
     }
 

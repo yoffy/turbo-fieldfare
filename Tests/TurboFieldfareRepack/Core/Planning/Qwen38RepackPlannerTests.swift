@@ -244,6 +244,18 @@ struct Qwen38RepackPlannerTests {
             $0.contains(".shards.")
         })
 
+        // PLE integer metadata (I64) stays resident, verbatim, unquantized.
+        for suffix in ["ple.ple_embedding.layer_multipliers",
+                       "ple.ple_embedding.ngram_heads_offsets",
+                       "ple.ple_embedding.ngram_heads_vocab_sizes"] {
+            let entry = try #require(plan.resident.entries.first {
+                $0.name == "language_model.model.layers.1." + suffix
+            })
+            #expect(entry.dtype == 4)
+            #expect(entry.quantSpec == nil)
+            #expect(entry.sourceScales == nil)
+            #expect(entry.sourceBiases == nil)
+        }
         // The four PLE shards stream to packed_ple, never resident.
         #expect(plan.pleShards.count == 4)
         for (i, shard) in plan.pleShards.enumerated() {

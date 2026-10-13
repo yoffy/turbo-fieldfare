@@ -514,7 +514,7 @@ enum RepackPlanner {
     // MARK: - Helpers
 
     private static func ietnyDtype(_ d: SourceTensor.Dtype) -> UInt8 {
-        switch d { case .u32: 0; case .bf16: 1; case .fp16: 2; case .fp32: 3 }
+        switch d { case .u32: 0; case .bf16: 1; case .fp16: 2; case .fp32: 3; case .i64: 4 }
     }
 
     private static func roundUpToPage(_ v: UInt64) -> UInt64 {

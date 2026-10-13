@@ -612,12 +612,12 @@ enum SyntheticSnapshot {
                         innerLogical: arch.pleEmbedDim, bits: 4,
                         groupSize: arch.groupSize, into: &tensors, rng: &rng)
                 }
-                appendUnquantizedBF16(name: prefix + ".ple.ple_embedding.layer_multipliers",
-                                      shape: [3], into: &tensors, rng: &rng)
-                appendUnquantizedBF16(name: prefix + ".ple.ple_embedding.ngram_heads_offsets",
-                                      shape: [2], into: &tensors, rng: &rng)
-                appendUnquantizedBF16(name: prefix + ".ple.ple_embedding.ngram_heads_vocab_sizes",
-                                      shape: [2], into: &tensors, rng: &rng)
+                appendUnquantizedI64(name: prefix + ".ple.ple_embedding.layer_multipliers",
+                                     shape: [3], into: &tensors, rng: &rng)
+                appendUnquantizedI64(name: prefix + ".ple.ple_embedding.ngram_heads_offsets",
+                                     shape: [2], into: &tensors, rng: &rng)
+                appendUnquantizedI64(name: prefix + ".ple.ple_embedding.ngram_heads_vocab_sizes",
+                                     shape: [2], into: &tensors, rng: &rng)
                 appendQuantizedWeight(name: prefix + ".ple.key_proj",
                                       outerShape: [arch.pleEmbedDim], innerLogical: arch.hidden,
                                       bits: 4, groupSize: arch.groupSize, into: &tensors, rng: &rng)
@@ -762,6 +762,15 @@ enum SyntheticSnapshot {
         var bytes = [UInt8](repeating: 0, count: elements * 2)
         for i in 0..<bytes.count { bytes[i] = UInt8(rng.next() & 0xFF) }
         tensors.append((name, "BF16", shape, bytes))
+    }
+
+    private static func appendUnquantizedI64(name: String, shape: [Int],
+                                            into tensors: inout [(String, String, [Int], [UInt8])],
+                                            rng: inout SplitMix64) {
+        let elements = shape.reduce(1, *)
+        var bytes = [UInt8](repeating: 0, count: elements * 8)
+        for i in 0..<bytes.count { bytes[i] = UInt8(rng.next() & 0xFF) }
+        tensors.append((name, "I64", shape, bytes))
     }
 
     // MARK: - Safetensors writer
