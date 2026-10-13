@@ -34,12 +34,20 @@ public struct Model {
     public var modelID: String { manifest.modelID }
     public var sourceSnapshotHash: String? { manifest.sourceSnapshotHash }
     public var sharedExpertWeightBits: Int { manifest.quant?.sharedExpert.weightBits ?? 8 }
-    /// Router (`mlp.gate`) weight bits. Qwen 3.6 ships an 8-bit router while
-    /// Qwen 3.5 ships a 4-bit router; the runner selects the matching
-    /// router/scalar-gate GEMV kernels from this. The scalar shared-expert
-    /// gate (`mlp.shared_expert_gate`) is quantized identically to the router
-    /// in both pinned checkpoints, so it shares this width.
+    /// Router (`mlp.gate`) weight bits. Qwen 3.6 and 3.8 ship an 8-bit
+    /// router while Qwen 3.5 ships a 4-bit router; the runner selects the
+    /// matching router/scalar-gate GEMV kernels from this. The scalar
+    /// shared-expert gate (`mlp.shared_expert_gate`) is quantized identically
+    /// to the router in all pinned checkpoints, so it shares this width.
     public var routerWeightBits: Int { manifest.quant?.router.weightBits ?? 8 }
+    /// Per-slot INT4 group widths from the manifest (`packed` slots record the
+    /// row-group their scales/biases were quantized with: 64 legacy, 32 for
+    /// the Qwen 3.8 base). Absent quant metadata (toy synthetics) means 64.
+    /// The router/scalar-gate slots stay 64 in every family.
+    public var embeddingGroupSize: Int { manifest.quant?.embedding.groupSize ?? 64 }
+    public var attentionGroupSize: Int { manifest.quant?.attention.groupSize ?? 64 }
+    public var sharedExpertGroupSize: Int { manifest.quant?.sharedExpert.groupSize ?? 64 }
+    public var routedExpertGroupSize: Int { manifest.quant?.routedExpert.groupSize ?? 64 }
 
     let residentBuffer: ResidentBuffer
     let residentIndex: ResidentIndex
@@ -153,7 +161,12 @@ public struct Model {
         try resident(name: "language_model.model.layers.\(L).post_attention_layernorm.weight")
     }
     public var finalNorm: TensorView {
-        try! resident(name: "language_model.model.norm.weight")
+        // Qwen 3.8 has no `model.norm`: the hyper-connection mixer trio
+        // closes the residual stream, so the mixer norm stands in.
+        if config.family == .qwen38 {
+            return try! resident(name: "language_model.model.hyper_connection_mixer.hc_norm.weight")
+        }
+        return try! resident(name: "language_model.model.norm.weight")
     }
 
     // MARK: - Per-head attention norms (Q/K only)
@@ -212,6 +225,100 @@ public struct Model {
     /// of the layer; shape `[1]`, BF16.
     public func layerScalar(layer L: Int) throws -> TensorView {
         try resident(name: "language_model.model.layers.\(L).layer_scalar")
+    }
+
+    // MARK: - Qwen 3.8 hyper-connection (gated residual)
+
+    /// Per-sublayer gated-residual weights. Every layer carries an `attn` and
+    /// an `mlp` bundle; `mixer` closes the stream after the last layer (no
+    /// `block_inject` there). `hc_norm` is BF16; the mix/inject projections
+    /// are INT4 affine at the attention-slot group width.
+    public func attnHcNorm(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).attn_hyper_connection.hc_norm.weight")
+    }
+    public func attnHcMixDown(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).attn_hyper_connection.input_mix_weight_down.weight")
+    }
+    public func attnHcMixUp(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).attn_hyper_connection.input_mix_weight_up.weight")
+    }
+    public func attnHcBlockInject(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).attn_hyper_connection.block_inject_weight.weight")
+    }
+    public func mlpHcNorm(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).mlp_hyper_connection.hc_norm.weight")
+    }
+    public func mlpHcMixDown(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).mlp_hyper_connection.input_mix_weight_down.weight")
+    }
+    public func mlpHcMixUp(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).mlp_hyper_connection.input_mix_weight_up.weight")
+    }
+    public func mlpHcBlockInject(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).mlp_hyper_connection.block_inject_weight.weight")
+    }
+    public var mixerHcNorm: TensorView {
+        try! resident(name: "language_model.model.hyper_connection_mixer.hc_norm.weight")
+    }
+    public var mixerDown: TensorView {
+        try! resident(name: "language_model.model.hyper_connection_mixer.input_mix_weight_down.weight")
+    }
+    public var mixerUp: TensorView {
+        try! resident(name: "language_model.model.hyper_connection_mixer.input_mix_weight_up.weight")
+    }
+
+    // MARK: - Qwen 3.8 QSA indexer (sparse attention)
+
+    /// `index_qk_proj` is INT4 affine at the attention-slot group width;
+    /// the q/k layernorms are BF16 over `indexerHeadDim`.
+    public func indexerQKProj(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).self_attn.indexer.index_qk_proj.weight")
+    }
+    public func indexerQNorm(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).self_attn.indexer.q_layernorm.weight")
+    }
+    public func indexerKNorm(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).self_attn.indexer.k_layernorm.weight")
+    }
+
+    // MARK: - Qwen 3.8 PLE (n-gram injection, layer 1)
+
+    /// Which layer carries the PLE module, detected by probing the resident
+    /// index (production: layer 1, i.e. one-indexed id 2). Nil when absent.
+    public func pleLayer() -> Int? {
+        for L in 0..<config.numLayers {
+            if residentIndex.entries["language_model.model.layers.\(L).ple.key_proj.weight"] != nil {
+                return L
+            }
+        }
+        return nil
+    }
+    public func pleKeyProj(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).ple.key_proj.weight")
+    }
+    public func pleValueProj(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).ple.value_proj.weight")
+    }
+    public func pleConv1d(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).ple.conv1d.weight")
+    }
+    public func pleNormConv(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).ple.norm_conv.weight")
+    }
+    public func pleNormKey(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).ple.norm_key.weight")
+    }
+    public func pleNormQuery(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).ple.norm_query.weight")
+    }
+    public func pleMultipliers(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).ple.ple_embedding.layer_multipliers")
+    }
+    public func pleHeadsOffsets(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).ple.ple_embedding.ngram_heads_offsets")
+    }
+    public func pleHeadsVocabSizes(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).ple.ple_embedding.ngram_heads_vocab_sizes")
     }
 
     // MARK: - Gated-DeltaNet linear attention (Qwen 3.6)
@@ -399,13 +506,6 @@ extension Model {
                             expertCachePolicy: ExpertCachePolicy = PreadExpertStreamer.cachePolicyDefault,
                             integrityPolicy: ModelIntegrityPolicy? = nil,
                             loadStats: UnsafeMutablePointer<ModelLoadStats>? = nil) throws -> Model {
-        // Qwen 3.8 repack/install support ships first; the QSA indexer,
-        // gated-residual mixing, and PLE lookup kernels are a follow-up
-        // inference PR. Refuse loudly instead of generating garbage.
-        if expecting.family == .qwen38 {
-            throw ModelError.indexCorrupt(
-                detail: "qwen38 inference is not implemented yet (QSA/gated-residual/PLE kernels pending)")
-        }
         var stats = ModelLoadStats()
         defer {
             loadStats?.pointee = stats

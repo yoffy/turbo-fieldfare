@@ -11,14 +11,22 @@ import Metal
 /// is one pass.
 final class EmbedLookupInt4 {
     private let pso: MTLComputePipelineState
+    private let psoG32: MTLComputePipelineState
 
     init(context: MetalContext) throws {
         self.pso = try context.pipeline("embed_lookup_int4")
+        self.psoG32 = try context.pipeline(
+            "embed_lookup_int4",
+            constants: [
+                MetalFunctionConstant(index: 27, value: .uint32(32)),
+                MetalFunctionConstant(index: 28, value: .bool(true)),
+            ])
     }
 
     /// Encodes the lookup. `table`, `scales`, `biases` typically live inside
     /// one resident blob — pass that buffer with the per-region offsets.
-    /// Pass `outScale = 1.0` to write the raw dequantized row.
+    /// Pass `outScale = 1.0` to write the raw dequantized row. `groupSize`
+    /// selects the manifest slot's recorded width (64 legacy, 32 Qwen 3.8).
     func encode(commandBuffer: MTLCommandBuffer,
                        table:  MTLBuffer, tableOffset:  Int = 0,
                        scales: MTLBuffer, scalesOffset: Int = 0,
@@ -26,11 +34,14 @@ final class EmbedLookupInt4 {
                        out:    MTLBuffer, outOffset: Int = 0,
                        tokenId: UInt32,
                        d: UInt32,
-                       outScale: Float) {
-        precondition(d % UInt32(Quantization.groupSize) == 0,
-                     "D must be a multiple of \(Quantization.groupSize)")
+                       outScale: Float,
+                       groupSize: Int = 64) {
+        precondition(groupSize == 32 || groupSize == 64,
+                     "groupSize must be 32 or 64, got \(groupSize)")
+        precondition(d % UInt32(groupSize) == 0,
+                     "D must be a multiple of \(groupSize)")
         guard let enc = commandBuffer.makeComputeCommandEncoder() else { return }
-        enc.setComputePipelineState(pso)
+        enc.setComputePipelineState(groupSize == 32 ? psoG32 : pso)
         enc.setBuffer(table,  offset: tableOffset,  index: 0)
         enc.setBuffer(scales, offset: scalesOffset, index: 1)
         enc.setBuffer(biases, offset: biasesOffset, index: 2)

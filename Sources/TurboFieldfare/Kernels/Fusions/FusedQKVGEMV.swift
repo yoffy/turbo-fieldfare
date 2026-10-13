@@ -10,6 +10,8 @@ final class FusedQKVGEMV {
 
     private let pso: MTLComputePipelineState
     private let specializedPSOs: [Shape: MTLComputePipelineState]
+    private let psoG32: MTLComputePipelineState
+    private let specializedPSOsG32: [Shape: MTLComputePipelineState]
 
     private static let realDecodeShapes: [Shape] = [
         Shape(qRows: 4096, kvRows: 2048, n: 2816),
@@ -20,6 +22,16 @@ final class FusedQKVGEMV {
         self.pso = try context.pipeline("dequant_int4_qkv_gemv_simd",
                                         constants: [],
                                         maxTotalThreadsPerThreadgroup: 512)
+        // Qwen 3.8 QSA projections (4-bit, group 32). The QKV body is shared
+        // with the decode GEMV, so the 32-wide path rides the same function
+        // constants (27/28).
+        let g32Constants: [MetalFunctionConstant] = [
+            MetalFunctionConstant(index: 27, value: .uint32(32)),
+            MetalFunctionConstant(index: 28, value: .bool(true)),
+        ]
+        self.psoG32 = try context.pipeline("dequant_int4_qkv_gemv_simd",
+                                           constants: g32Constants,
+                                           maxTotalThreadsPerThreadgroup: 512)
         var variants: [Shape: MTLComputePipelineState] = [:]
         for shape in Self.realDecodeShapes {
             variants[shape] = try context.pipeline(
@@ -33,6 +45,19 @@ final class FusedQKVGEMV {
                 maxTotalThreadsPerThreadgroup: 512)
         }
         self.specializedPSOs = variants
+        var g32: [Shape: MTLComputePipelineState] = [:]
+        for shape in Self.realDecodeShapes {
+            g32[shape] = try context.pipeline(
+                "dequant_int4_qkv_gemv_simd",
+                constants: [
+                    MetalFunctionConstant(index: 23, value: .uint32(shape.qRows)),
+                    MetalFunctionConstant(index: 24, value: .uint32(shape.kvRows)),
+                    MetalFunctionConstant(index: 25, value: .uint32(shape.n)),
+                    MetalFunctionConstant(index: 26, value: .bool(true)),
+                ] + g32Constants,
+                maxTotalThreadsPerThreadgroup: 512)
+        }
+        self.specializedPSOsG32 = g32
     }
 
     func encode(commandBuffer: MTLCommandBuffer,
@@ -51,16 +76,23 @@ final class FusedQKVGEMV {
                        vOut: MTLBuffer, vOutOffset: Int = 0,
                        qRows: UInt32,
                        kvRows: UInt32,
-                       n: UInt32) {
-        precondition(n % UInt32(Quantization.groupSize) == 0,
-                     "N must be a multiple of \(Quantization.groupSize)")
+                       n: UInt32,
+                       groupSize: Int = 64) {
+        precondition(groupSize == 32 || groupSize == 64,
+                     "groupSize must be 32 or 64, got \(groupSize)")
+        precondition(n % UInt32(groupSize) == 0,
+                     "N must be a multiple of \(groupSize)")
         precondition(qWeightsOffset % 2 == 0 &&
                      kWeightsOffset % 2 == 0 &&
                      vWeightsOffset % 2 == 0,
                      "FusedQKVGEMV needs 2-aligned weights offsets")
         guard let enc = commandBuffer.makeComputeCommandEncoder() else { return }
         let shape = Shape(qRows: qRows, kvRows: kvRows, n: n)
-        enc.setComputePipelineState(specializedPSOs[shape] ?? pso)
+        if groupSize == 32 {
+            enc.setComputePipelineState(specializedPSOsG32[shape] ?? psoG32)
+        } else {
+            enc.setComputePipelineState(specializedPSOs[shape] ?? pso)
+        }
         enc.setBuffer(qWeights, offset: qWeightsOffset, index: 0)
         enc.setBuffer(qScales, offset: qScalesOffset, index: 1)
         enc.setBuffer(qBiases, offset: qBiasesOffset, index: 2)

@@ -340,11 +340,8 @@ public struct ArchConfig: Sendable, Equatable {
     /// the same 3-linear + 1-full motif, but the full layers use QSA sparse
     /// attention (indexer below), every sub-layer is wrapped in a 4-branch
     /// gated residual, and layer index 1 carries the PLE n-gram table
-    /// (installed under `packed_ple/`, streamed from SSD like experts).
+    /// (installed under `packed_ple/`, row-streamed from SSD on CPU).
     /// 512 routed experts (top-10) plus a sigmoid-gated shared expert.
-    /// Repack-only for now: the QSA indexer, gated-residual mixing, and PLE
-    /// lookup kernels are not implemented yet, so the runner must refuse to
-    /// generate with this family until the inference PR lands.
     public static let qwen38_FlashNext = ArchConfig(
         hiddenSize: 2560,
         intermediateSize: 640,
@@ -427,6 +424,16 @@ public struct ArchConfig: Sendable, Equatable {
         }
         shapes.append((m: intermediateSize, n: hiddenSize))
         shapes.append((m: hiddenSize, n: intermediateSize))
+        if hcCount > 0 {
+            // Qwen 3.8 gated-residual + indexer + PLE decode projections.
+            let hcHidden = hcCount * hiddenSize
+            shapes.append((m: hcLowrank, n: hcHidden))
+            shapes.append((m: hcHidden, n: hcLowrank))
+            shapes.append((m: hcCount, n: hcHidden))
+            shapes.append((m: (indexerNHeads + indexerKvHeads) * indexerHeadDim, n: hiddenSize))
+            shapes.append((m: hcHidden, n: pleEmbedDim))
+            shapes.append((m: hiddenSize, n: pleEmbedDim))
+        }
         return shapes
     }
 
@@ -508,7 +515,7 @@ public struct TensorView: @unchecked Sendable {
     public let biasOffset: UInt64
     public let biasLength: UInt64
     public let shape: (UInt32, UInt32, UInt32, UInt32)
-    /// Dtype byte. 0 = U32, 1 = BF16, 2 = FP16, 3 = FP32.
+    /// Dtype byte. 0 = U32, 1 = BF16, 2 = FP16, 3 = FP32, 4 = I64.
     public let dtype: UInt8
 
     public init(buffer: MTLBuffer,

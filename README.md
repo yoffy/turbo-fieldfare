@@ -395,6 +395,36 @@ Rerunning all three with 16 GB pinned elsewhere — leaving an ~8 GB working set
 output, so Qwen 3.6 holds the same bounded-memory contract as Gemma 4 while
 using about 0.7 GB less. Its install needs about 19.6 GB of disk.
 
+### Qwen 3.8-Flash-Next
+
+TurboFieldfare also runs
+[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) from the
+pinned `mlx-community/Qwen3.8-Flash-Next-4bit` checkpoint: 48 layers / hidden
+2560 with the same 3-linear + 1-full motif, but the 12 full layers use QSA
+sparse attention (block-pooled indexer, budget 2048), every sub-layer is
+wrapped in a 4-branch gated residual, layer 1 carries a PLE n-gram table
+(row-streamed from SSD, a few KB of I/O per token), and 512 routed experts
+(top-10) join the sigmoid-gated shared expert. The 4-bit base is group-32
+with 8-bit group-64 gate overrides. The vision tower and MTP head are
+omitted, matching the repack scope.
+
+```bash
+swift run -c release TurboFieldfareRepack \
+  --model qwen38 \
+  --output scratch/qwen38.gturbo \
+  --overwrite
+swift run -c release TurboFieldfareCLI \
+  --model scratch/qwen38.gturbo \
+  --messages-file messages.json
+```
+
+The Mac app selects it with `TURBO_FIELDFARE_MODEL=qwen38`; the server
+auto-detects the installed model and serves it as `qwen3.8-flash-next`.
+Estimated install size is about 111 GB (from the upstream `usedStorage`
+figure; replaced by a measured value after the first real install).
+Short contexts run the dense prefix exactly; no benchmark numbers are claimed
+yet — protocol-conformant measurement is still to come.
+
 ### Future work
 
 - Build iPhone and iPad apps, then measure inference speed and memory use on

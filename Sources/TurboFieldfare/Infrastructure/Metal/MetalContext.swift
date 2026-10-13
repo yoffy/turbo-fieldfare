@@ -77,6 +77,7 @@ public final class MetalContext: @unchecked Sendable {
         "fused",
         "prefill",
         "gdn",
+        "qwen38",
     ]
 
     /// Bundle locations for runtime shader modules.
@@ -93,6 +94,7 @@ public final class MetalContext: @unchecked Sendable {
         "rope": "Metal/Primitives",
         "tensorops": "Metal/TensorCore",
         "utility": "Metal/Primitives",
+        "qwen38": "Metal/Qwen38",
     ]
 
     private static func shaderURL(module: String) -> URL? {

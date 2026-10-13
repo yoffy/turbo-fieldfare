@@ -186,6 +186,18 @@ public final class KVCacheManager {
         return (vBuffers[layer], physicalSlot(layer: layer, position: position) * strides[layer])
     }
 
+    /// Base K/V buffers plus per-token stride for indexed row gather.
+    /// QSA sparse attention compacts the selected positions into scratch and
+    /// runs the dense kernel over the compacted sequence. Valid only for full
+    /// layers without a ring (positions are physically contiguous there).
+    public func gatherBase(layer: Int) -> (k: MTLBuffer, v: MTLBuffer, strideBytes: Int) {
+        precondition(layerKind(layer) == .full,
+                     "gatherBase requires a full layer")
+        precondition(ringCapacity(layer: layer) == 0,
+                     "gatherBase requires a ring-free layer")
+        return (kBuffers[layer], vBuffers[layer], strides[layer])
+    }
+
     public func kRange(layer: Int, start: Int, count: Int) -> (buffer: MTLBuffer, offset: Int, stride: Int) {
         validateRange(start: start, count: count)
         validateContiguousPhysicalRange(layer: layer, start: start, count: count)

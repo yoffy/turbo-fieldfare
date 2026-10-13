@@ -20,6 +20,12 @@ final class GDN {
     private let gatedNormPSO: MTLComputePipelineState
     private let inProjPSO: MTLComputePipelineState
     private let inProjSpecializedPSO: MTLComputePipelineState?
+    /// 32-wide input-projection variants (Qwen 3.8 linear layers). The shared
+    /// dequant body reads the group width from function constants 27/28.
+    private let inProjG32PSO: MTLComputePipelineState
+    private let inProjSpecializedG32PSO: MTLComputePipelineState?
+    /// Group width of the `in_proj_*` weights (64 legacy, 32 Qwen 3.8 base).
+    private let projGroupSize: Int
 
     let config: LinearAttentionConfig
 
@@ -28,7 +34,11 @@ final class GDN {
     /// package: an unspecialized INT4 GEMV runs ~102 GB/s against ~141 GB/s
     /// specialized, so the runtime path must not be the only one available.
     init(context: MetalContext, config: LinearAttentionConfig,
-         specializedHiddenSize: Int? = nil) throws {
+         specializedHiddenSize: Int? = nil,
+         projGroupSize: Int = 64) throws {
+        precondition(projGroupSize == 32 || projGroupSize == 64,
+                     "unsupported projGroupSize \(projGroupSize)")
+        self.projGroupSize = projGroupSize
         precondition(config.keyHeadDim > 0 && config.keyHeadDim % 32 == 0,
                      "keyHeadDim must be a positive multiple of 32")
         precondition(config.keyHeadDim / 32 <= 8,
@@ -48,6 +58,13 @@ final class GDN {
         self.inProjPSO = try context.pipeline("gdn_in_proj_gemv_simd",
                                               constants: [],
                                               maxTotalThreadsPerThreadgroup: 512)
+        let gdnG32Extra: [MetalFunctionConstant] = [
+            MetalFunctionConstant(index: 27, value: .uint32(32)),
+            MetalFunctionConstant(index: 28, value: .bool(true)),
+        ]
+        self.inProjG32PSO = try context.pipeline("gdn_in_proj_gemv_simd",
+                                                 constants: gdnG32Extra,
+                                                 maxTotalThreadsPerThreadgroup: 512)
         if let n = specializedHiddenSize {
             self.inProjSpecializedPSO = try context.pipeline(
                 "gdn_in_proj_gemv_simd",
@@ -59,8 +76,21 @@ final class GDN {
                     MetalFunctionConstant(index: 94, value: .bool(true)),
                 ],
                 maxTotalThreadsPerThreadgroup: 512)
+            self.inProjSpecializedG32PSO = try context.pipeline(
+                "gdn_in_proj_gemv_simd",
+                constants: [
+                    MetalFunctionConstant(index: 90, value: .uint32(UInt32(config.qkvDim))),
+                    MetalFunctionConstant(index: 91, value: .uint32(UInt32(config.valueDim))),
+                    MetalFunctionConstant(index: 92, value: .uint32(UInt32(config.numVHeads))),
+                    MetalFunctionConstant(index: 93, value: .uint32(UInt32(n))),
+                    MetalFunctionConstant(index: 94, value: .bool(true)),
+                    MetalFunctionConstant(index: 27, value: .uint32(32)),
+                    MetalFunctionConstant(index: 28, value: .bool(true)),
+                ],
+                maxTotalThreadsPerThreadgroup: 512)
         } else {
             self.inProjSpecializedPSO = nil
+            self.inProjSpecializedG32PSO = nil
         }
     }
 
@@ -76,15 +106,21 @@ final class GDN {
                                 a: TensorView, aOut: MTLBuffer,
                                 b: TensorView, bOut: MTLBuffer,
                                 hiddenSize: Int) {
-        precondition(hiddenSize % Quantization.groupSize == 0,
-                     "hiddenSize must be a multiple of \(Quantization.groupSize)")
+        precondition(hiddenSize % 32 == 0,
+                     "hiddenSize must be a multiple of 32 (supports group 32/64)")
+        precondition(hiddenSize % projGroupSize == 0,
+                     "hiddenSize must be a multiple of group \(projGroupSize)")
         // The row body reads packed weights through a `ushort*`; the repacker
         // guarantees two-byte sub-tensor alignment but not four-byte.
         precondition(Int(qkv.offset) % 2 == 0 && Int(z.offset) % 2 == 0 &&
                      Int(a.offset) % 2 == 0 && Int(b.offset) % 2 == 0,
                      "gdn_in_proj_gemv_simd needs 2-aligned weights offsets")
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
-        encoder.setComputePipelineState(inProjSpecializedPSO ?? inProjPSO)
+        if projGroupSize == 32 {
+            encoder.setComputePipelineState(inProjSpecializedG32PSO ?? inProjG32PSO)
+        } else {
+            encoder.setComputePipelineState(inProjSpecializedPSO ?? inProjPSO)
+        }
         for (slot, view) in [qkv, z, a, b].enumerated() {
             encoder.setBuffer(view.buffer, offset: Int(view.offset), index: slot * 3)
             encoder.setBuffer(view.buffer, offset: Int(view.scaleOffset), index: slot * 3 + 1)

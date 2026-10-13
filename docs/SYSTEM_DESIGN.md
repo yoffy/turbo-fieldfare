@@ -120,6 +120,17 @@ quantization: 4-bit embedding and attention weights, an 8-bit router, and
 4-bit shared and routed experts. Missing or incompatible quantization metadata
 is rejected.
 
+Qwen 3.8 (`arch.family == "qwen38"`) extends the tree with `packed_ple/`
+(`layout.json` plus one `shard_%03d.bin` per n-gram table slice, each holding
+quantized weights followed by BF16 scales then biases) and per-slot group
+widths in the manifest quant record: the 4-bit base is group-32 while the
+8-bit gate overrides stay group-64. The resident weights additionally carry
+the QSA indexer bundle, per-sub-layer hyper-connection weights, the PLE
+projections, and the closing mixer trio (there is no `model.norm`); the
+vision tower and MTP head are omitted. At inference the PLE table is
+row-streamed from SSD on CPU (one row per hashed head per token) and never
+enters GPU memory.
+
 `manifest.json` marks the installation as complete and defines what the runtime
 may load. It records the architecture, file sizes, and SHA-256 hashes. Without
 it, the runtime treats the installation as partial. `verified-install.json`
@@ -429,9 +440,10 @@ references lead to the supporting code and tests.
 
 ## Scope and limitations
 
-The runtime supports text-only generation from two pinned instruction
-checkpoints, Gemma 4 26B-A4B and Qwen 3.6 35B-A3B. Both source models support
-image input; TurboFieldfare omits both vision towers.
+The runtime supports text-only generation from three pinned instruction
+checkpoints, Gemma 4 26B-A4B, Qwen 3.6 35B-A3B, and Qwen3.8-Flash-Next. All
+three source models support image input; TurboFieldfare omits every vision
+tower (and the Qwen 3.8 MTP head).
 
 Qwen 3.6 is selected from `manifest.json -> arch.family`. It is a hybrid of 30
 gated-DeltaNet linear-attention layers and 10 gated full-attention layers, with
@@ -447,10 +459,15 @@ needs about 19.6 GB of disk against Gemma's 14.3 GB. Acceptance evidence covers
 The Mac app offers 4K, 8K, 16K, 32K, and 64K context lengths. Published app
 and CLI acceptance evidence covers up to 4K. Vision input, training,
 fine-tuning, server batching, remote serving, and general model support are
-outside the current scope. The runtime supports the two architectures above by
+outside the current scope. The runtime supports the three architectures above by
 explicit enumeration — each with its own pinned checkpoint, compile-time
 baseline, and manifest contract — rather than by discovering arbitrary
-checkpoints. The optional HTTP server is loopback-only, owns one
+checkpoints. Qwen 3.8 replaces the plain residual graph with per-sub-layer
+4-branch gated residuals closed by a mixer, QSA sparse attention on every
+fourth layer (exact block-pooled top-k selection, dense for short contexts),
+and PLE n-gram injection on layer 1; its chunked prefill currently advances
+the same per-token state machine as decode while batched QSA/hyper prefill
+kernels remain follow-up work. The optional HTTP server is loopback-only, owns one
 warm model, serializes generation, and retains one verified conversational KV
 prefix by default. It retains only that prefix. See the
 [local server guide](OPENAI_SERVER.md).

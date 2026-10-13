@@ -25,6 +25,20 @@ constant uint FC_INT4_QKV_MQ [[function_constant(23)]];
 constant uint FC_INT4_QKV_MKV [[function_constant(24)]];
 constant uint FC_INT4_QKV_N [[function_constant(25)]];
 constant bool FC_INT4_QKV_USE_FC [[function_constant(26)]];
+// Group width selector: absent/false-use = 64 (legacy pipelines), 32 = Qwen
+// 3.8 base. Read via `int4_group_size()` so existing constant-folded
+// pipelines keep bit-identical codegen when the constant is unset.
+constant uint FC_INT4_GROUP [[function_constant(27)]];
+constant bool FC_INT4_USE_GROUP [[function_constant(28)]];
+
+static inline uint int4_group_size() {
+    if (is_function_constant_defined(FC_INT4_USE_GROUP) &&
+        FC_INT4_USE_GROUP &&
+        is_function_constant_defined(FC_INT4_GROUP)) {
+        return (FC_INT4_GROUP == 32u) ? 32u : 64u;
+    }
+    return 64u;
+}
 
 static inline uint int4_fc_m(constant uint& M) {
     return (is_function_constant_defined(FC_INT4_USE_FC) &&
@@ -62,8 +76,8 @@ inline uint nib_hi(uint8_t b) { return uint(b >> 4); }
 
 kernel void embed_lookup_int4(
     device const uint8_t* table     [[buffer(0)]],   // [V, D/2] nibbles
-    device const bfloat*  scales    [[buffer(1)]],   // [V, D/64] BF16
-    device const bfloat*  biases    [[buffer(2)]],   // [V, D/64] BF16
+    device const bfloat*  scales    [[buffer(1)]],   // [V, D/G] BF16
+    device const bfloat*  biases    [[buffer(2)]],   // [V, D/G] BF16
     device half*          out       [[buffer(3)]],   // [D] FP16
     constant uint&        token_id  [[buffer(4)]],
     constant uint&        D         [[buffer(5)]],
@@ -71,14 +85,15 @@ kernel void embed_lookup_int4(
     uint                  gid       [[thread_position_in_grid]]
 ) {
     if (gid >= D) return;
-    const uint groups_per_row = D / kGroupSize;
+    const uint G = int4_group_size();
+    const uint groups_per_row = D / G;
     device const uint8_t* row_q = table  + uint(token_id) * (D / 2u);
     device const bfloat*  row_s = scales + uint(token_id) * groups_per_row;
     device const bfloat*  row_b = biases + uint(token_id) * groups_per_row;
     uint8_t byte = row_q[gid >> 1];
     uint    q    = (gid & 1u) ? uint(byte >> 4) : uint(byte & 0xFu);
-    float   s    = float(row_s[gid / kGroupSize]);
-    float   b    = float(row_b[gid / kGroupSize]);
+    float   s    = float(row_s[gid / G]);
+    float   b    = float(row_b[gid / G]);
     out[gid] = half((float(q) * s + b) * out_scale);
 }
 
@@ -105,6 +120,58 @@ static inline void dequant_int4_gemv_simd_body(
 ) {
     const uint row = tg_idx * rows_per_tg + sg_idx;
     if (row >= M) return;
+    const uint G = int4_group_size();
+    if (G == 32u) {
+        // 32-wide path (Qwen 3.8 base): twice the groups of the 64-wide
+        // path. Fast blocks cover 8 groups per 128-byte chunk (4 lanes per
+        // group, 8 contiguous elements each); the remainder covers one
+        // element per lane. Same affine factoring as the 64-wide path.
+        const uint n_groups32  = N / 32u;
+        const uint row_bytes32 = N / 2;
+        device const uint8_t* W_row32 = W      + uint(row) * row_bytes32;
+        device const bfloat*  s_row32 = scales + uint(row) * n_groups32;
+        device const bfloat*  b_row32 = biases + uint(row) * n_groups32;
+        const uint full_blocks32 = n_groups32 / 8u;
+        for (uint blk = 0; blk < full_blocks32; ++blk) {
+            const uint byte_base = blk * 128u + lane * 4u;
+            device const ushort* wp = (device const ushort*)(W_row32 + byte_base);
+            const uint w4 = uint(wp[0]) | (uint(wp[1]) << 16);
+            const uint g  = blk * 8u + (lane >> 2);
+            const float s = float(s_row32[g]);
+            const float b = float(b_row32[g]);
+            const uint elem = byte_base * 2u;
+            const half4 xa = *((device const half4*)(x + elem));
+            const half4 xb = *((device const half4*)(x + elem + 4u));
+            const uint b0 =  w4        & 0xFFu;
+            const uint b1 = (w4 >> 8)  & 0xFFu;
+            const uint b2 = (w4 >> 16) & 0xFFu;
+            const uint b3 = (w4 >> 24) & 0xFFu;
+            const float e0 = float(xa.x), e1 = float(xa.y), e2 = float(xa.z), e3 = float(xa.w);
+            const float e4 = float(xb.x), e5 = float(xb.y), e6 = float(xb.z), e7 = float(xb.w);
+            float dot = 0.0f;
+            dot = fma(float(b0 & 0x0Fu), e0, dot); dot = fma(float(b0 >> 4), e1, dot);
+            dot = fma(float(b1 & 0x0Fu), e2, dot); dot = fma(float(b1 >> 4), e3, dot);
+            dot = fma(float(b2 & 0x0Fu), e4, dot); dot = fma(float(b2 >> 4), e5, dot);
+            dot = fma(float(b3 & 0x0Fu), e6, dot); dot = fma(float(b3 >> 4), e7, dot);
+            const float sum = e0 + e1 + e2 + e3 + e4 + e5 + e6 + e7;
+            acc = fma(s, dot, acc);
+            acc = fma(b, sum, acc);
+        }
+        for (uint g = full_blocks32 * 8u; g < n_groups32; ++g) {
+            const float s = float(s_row32[g]);
+            const float b = float(b_row32[g]);
+            const uint8_t byte = W_row32[g * 16u + (lane >> 1)];
+            const uint q = (lane & 1u) ? uint(byte >> 4) : uint(byte & 0x0Fu);
+            const float xv = float(x[g * 32u + lane]);
+            acc = fma(s, float(q) * xv, acc);
+            acc = fma(b, xv, acc);
+        }
+        acc = simd_sum(acc);
+        if (lane == 0) {
+            y[row] = half(acc);
+        }
+        return;
+    }
     const uint n_groups  = N / kGroupSize;
     const uint row_bytes = N / 2;
     device const uint8_t* W_row = W      + uint(row) * row_bytes;

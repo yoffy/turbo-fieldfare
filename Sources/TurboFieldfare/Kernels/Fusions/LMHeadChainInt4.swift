@@ -16,6 +16,8 @@ final class LMHeadChainInt4 {
     private let rms: RMSNorm
     private let rowGreedy: MTLComputePipelineState
     private let rowGreedySpecialized: MTLComputePipelineState
+    private let rowGreedyG32: MTLComputePipelineState
+    private let rowGreedySpecializedG32: MTLComputePipelineState
     private let rowReducer: MTLComputePipelineState
     private let xNormedBuffer: MTLBuffer
     private let rowSummariesBuffer: MTLBuffer
@@ -36,6 +38,23 @@ final class LMHeadChainInt4 {
                 MetalFunctionConstant(index: 11, value: .uint32(UInt32(maxVocab))),
                 MetalFunctionConstant(index: 13, value: .bool(true)),
             ])
+        // Qwen 3.8 untied head (4-bit, group 32): same chunk/reduce flow,
+        // 32-wide dequant folded at pipeline creation. The 64-wide pipelines
+        // above stay bit-identical.
+        let g32Constants: [MetalFunctionConstant] = [
+            MetalFunctionConstant(index: 14, value: .uint32(32)),
+            MetalFunctionConstant(index: 15, value: .bool(true)),
+        ]
+        self.rowGreedyG32 = try context.pipeline(
+            "lm_head_greedy_int4_rows_chunk_raw",
+            constants: g32Constants)
+        self.rowGreedySpecializedG32 = try context.pipeline(
+            "lm_head_greedy_int4_rows_chunk_raw",
+            constants: [
+                MetalFunctionConstant(index: 10, value: .uint32(UInt32(maxD))),
+                MetalFunctionConstant(index: 11, value: .uint32(UInt32(maxVocab))),
+                MetalFunctionConstant(index: 13, value: .bool(true)),
+            ] + g32Constants)
         self.rowReducer = try context.pipeline("lm_head_greedy_int4_rows_reduce")
         self.maxD = maxD
         self.maxVocab = maxVocab
@@ -69,31 +88,52 @@ final class LMHeadChainInt4 {
                             outToken: MTLBuffer,
                             d: UInt32,
                             vocab: UInt32,
-                            rmsEps: Float = 1e-6) {
+                            rmsEps: Float = 1e-6,
+                            groupSize: Int = 64,
+                            skipNorm: Bool = false) {
         precondition(Int(d) <= maxD, "d=\(d) exceeds wrapper maxD=\(maxD)")
         precondition(Int(vocab) <= maxVocab,
                      "vocab=\(vocab) exceeds wrapper maxVocab=\(maxVocab)")
-        precondition(Int(d) % Quantization.groupSize == 0,
-                     "d must be a multiple of \(Quantization.groupSize)")
+        precondition(groupSize == 32 || groupSize == 64,
+                     "groupSize must be 32 or 64, got \(groupSize)")
+        precondition(Int(d) % groupSize == 0,
+                     "d must be a multiple of \(groupSize)")
         precondition(hiddenOffset >= 0, "hiddenOffset must be non-negative")
         precondition(weightsOffset % 2 == 0,
                      "lm_head_greedy_int4_rows_chunk_raw needs a 2-aligned weightsOffset")
 
         let rowGroups = (Int(vocab) + Self.rowsPerThreadgroup - 1)
             / Self.rowsPerThreadgroup
-        rms.encodeBF16W(commandBuffer: commandBuffer,
-                        x: hidden,
-                        xOffset: hiddenOffset,
-                        weight: normWeight,
-                        weightOffset: normOffset,
-                        out: xNormedBuffer,
-                        d: d,
-                        eps: rmsEps)
+        // Qwen 3.8 has no final norm: the hyper-connection mixer output
+        // feeds the head directly. Otherwise RMSNorm into the staging buffer.
+        let headInput: MTLBuffer
+        if skipNorm {
+            headInput = hidden
+        } else {
+            rms.encodeBF16W(commandBuffer: commandBuffer,
+                            x: hidden,
+                            xOffset: hiddenOffset,
+                            weight: normWeight,
+                            weightOffset: normOffset,
+                            out: xNormedBuffer,
+                            d: d,
+                            eps: rmsEps)
+            headInput = xNormedBuffer
+        }
 
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             let specialized = d == specializedD && vocab == specializedVocab
-            encoder.setComputePipelineState(specialized ? rowGreedySpecialized : rowGreedy)
-            encoder.setBuffer(xNormedBuffer, offset: 0, index: 0)
+            let pso: MTLComputePipelineState
+            if groupSize == 32 {
+                pso = specialized ? rowGreedySpecializedG32 : rowGreedyG32
+            } else {
+                pso = specialized ? rowGreedySpecialized : rowGreedy
+            }
+            encoder.setComputePipelineState(pso)
+            // skipNorm reads `hidden` at hiddenOffset; the normed path always
+            // starts at staging offset 0.
+            let headInputOffset = skipNorm ? hiddenOffset : 0
+            encoder.setBuffer(headInput, offset: headInputOffset, index: 0)
             encoder.setBuffer(weights, offset: weightsOffset, index: 1)
             encoder.setBuffer(scales, offset: scalesOffset, index: 2)
             encoder.setBuffer(biases, offset: biasesOffset, index: 3)

@@ -29,11 +29,18 @@ public struct MoEExpertOffsets {
 }
 
 final class MoE {
-    static let maxStreamedExperts = 8
+    /// Maximum top-k the streamer + kernels can carry in one decode step.
+    /// Qwen 3.8 selects 10 of 512 experts; older families select 8 of
+    /// 128/256. `validate` accepts exactly the supported top-k values so a
+    /// misconfigured arch fails loudly instead of silently dropping experts.
+    static let maxStreamedExperts = 10
+    static let supportedTopK: [UInt32] = [8, 10]
+    /// Maximum router width (Qwen 3.8: 512 experts).
+    static let maxNumExperts = 512
 
     private let realDecodeD: UInt32
     private let realDecodeF: UInt32
-    private static let realDecodeTopK: UInt32 = 8
+    private let realDecodeTopK: UInt32
     private let realDecodeNumExperts: UInt32
 
     private let routerGemvPSO: MTLComputePipelineState
@@ -42,6 +49,8 @@ final class MoE {
     private let routerGemvInt4SpecializedPSO: MTLComputePipelineState
     private let routerSelectK8PSO: MTLComputePipelineState
     private let routerSelectK8SpecializedPSO: MTLComputePipelineState
+    private let routerSelectK10PSO: MTLComputePipelineState
+    private let routerSelectK10SpecializedPSO: MTLComputePipelineState
     private let routerLogits: MTLBuffer
     private let phase1U16PSO: MTLComputePipelineState
     private let phase1U16SpecializedPSO: MTLComputePipelineState
@@ -49,20 +58,45 @@ final class MoE {
     private let phase1SubsetU16SpecializedPSO: MTLComputePipelineState
     private let phase2ReduceK8PSO: MTLComputePipelineState
     private let phase2ReduceK8SpecializedPSO: MTLComputePipelineState
+    private let phase2ReduceK10PSO: MTLComputePipelineState
+    private let phase2ReduceK10SpecializedPSO: MTLComputePipelineState
+    /// 32-wide routed-expert variants (Qwen 3.8). Same kernels with
+    /// `FC_MOE_GROUP=32` folded; the 64-wide PSOs above stay bit-identical.
+    private let phase1U16G32PSO: MTLComputePipelineState
+    private let phase1U16SpecializedG32PSO: MTLComputePipelineState
+    private let phase1SubsetU16G32PSO: MTLComputePipelineState
+    private let phase1SubsetU16SpecializedG32PSO: MTLComputePipelineState
+    private let phase2ReduceK8G32PSO: MTLComputePipelineState
+    private let phase2ReduceK8SpecializedG32PSO: MTLComputePipelineState
+    private let phase2ReduceK10G32PSO: MTLComputePipelineState
+    private let phase2ReduceK10SpecializedG32PSO: MTLComputePipelineState
+    /// Quantized group width of the routed-expert weights (64 legacy, 32 for
+    /// the Qwen 3.8 base). Router/scalar-gate GEMVs always read group 64.
+    private let routedGroupSize: Int
     private let routedArgEncoder: MTLArgumentEncoder
     private let reusableRoutedArgBuffer: MTLBuffer
 
     /// `specializedD`/`specializedF`/`specializedNumExperts` describe the
     /// production shape this instance specializes for (Gemma 4 by default;
-    /// Qwen 3.6 passes 2048/512/256). `siluActivation` selects the expert
-    /// FFN activation (false = gelu_pytorch_tanh, true = silu).
+    /// Qwen 3.6 passes 2048/512/256, Qwen 3.8 passes 2560/640/512).
+    /// `siluActivation` selects the expert FFN activation (false =
+    /// gelu_pytorch_tanh, true = silu). `specializedTopK` selects the decode
+    /// top-k the specialized pipelines fold (8 legacy, 10 for Qwen 3.8).
     init(context: MetalContext,
          siluActivation: Bool = false,
          specializedD: UInt32 = 2816,
          specializedF: UInt32 = 704,
-         specializedNumExperts: UInt32 = 128) throws {
+         specializedNumExperts: UInt32 = 128,
+         specializedTopK: UInt32 = 8,
+         routedGroupSize: Int = 64) throws {
+        precondition(Self.supportedTopK.contains(specializedTopK),
+                     "unsupported specializedTopK \(specializedTopK)")
+        precondition(routedGroupSize == 32 || routedGroupSize == 64,
+                     "unsupported routedGroupSize \(routedGroupSize)")
+        self.routedGroupSize = routedGroupSize
         self.realDecodeD = specializedD
         self.realDecodeF = specializedF
+        self.realDecodeTopK = specializedTopK
         self.realDecodeNumExperts = specializedNumExperts
         let activationConstants: [MetalFunctionConstant] = siluActivation
             ? [MetalFunctionConstant(index: 4, value: .bool(true))]
@@ -70,13 +104,13 @@ final class MoE {
         let moeConstants: [MetalFunctionConstant] = [
             MetalFunctionConstant(index: 0, value: .uint32(specializedD)),
             MetalFunctionConstant(index: 1, value: .uint32(specializedF)),
-            MetalFunctionConstant(index: 2, value: .uint32(Self.realDecodeTopK)),
+            MetalFunctionConstant(index: 2, value: .uint32(specializedTopK)),
             MetalFunctionConstant(index: 3, value: .bool(true)),
         ] + activationConstants
         let routerConstants: [MetalFunctionConstant] = [
             MetalFunctionConstant(index: 40, value: .uint32(specializedNumExperts)),
             MetalFunctionConstant(index: 41, value: .uint32(specializedD)),
-            MetalFunctionConstant(index: 42, value: .uint32(Self.realDecodeTopK)),
+            MetalFunctionConstant(index: 42, value: .uint32(specializedTopK)),
             MetalFunctionConstant(index: 43, value: .bool(true)),
         ]
         let routerName = "router_gemv_gemma4_r4"
@@ -102,6 +136,12 @@ final class MoE {
         self.routerSelectK8SpecializedPSO = try context.pipeline(
             "router_topk_select_k8",
             constants: routerConstants)
+        // Qwen 3.8 top-10 tail: same insertion-sort + renormalized top-k
+        // softmax as k8, over 10 slots (see `router_topk_select_k10`).
+        self.routerSelectK10PSO = try context.pipeline("router_topk_select_k10")
+        self.routerSelectK10SpecializedPSO = try context.pipeline(
+            "router_topk_select_k10",
+            constants: routerConstants)
         self.phase1U16PSO = try context.pipeline(
             "moe_phase1_gate_up_act_u16load", constants: activationConstants)
         self.phase1U16SpecializedPSO = try context.pipeline(
@@ -116,9 +156,39 @@ final class MoE {
         self.phase2ReduceK8SpecializedPSO = try context.pipeline(
             "moe_phase2_down_reduce_k8",
             constants: moeConstants)
+        self.phase2ReduceK10PSO = try context.pipeline("moe_phase2_down_reduce_k10")
+        self.phase2ReduceK10SpecializedPSO = try context.pipeline(
+            "moe_phase2_down_reduce_k10",
+            constants: moeConstants)
+        let g32Extra: [MetalFunctionConstant] = [
+            MetalFunctionConstant(index: 5, value: .uint32(32)),
+            MetalFunctionConstant(index: 6, value: .bool(true)),
+        ]
+        self.phase1U16G32PSO = try context.pipeline(
+            "moe_phase1_gate_up_act_u16load",
+            constants: activationConstants + g32Extra)
+        self.phase1U16SpecializedG32PSO = try context.pipeline(
+            "moe_phase1_gate_up_act_u16load",
+            constants: moeConstants + g32Extra)
+        self.phase1SubsetU16G32PSO = try context.pipeline(
+            "moe_phase1_gate_up_act_subset_u16load",
+            constants: activationConstants + g32Extra)
+        self.phase1SubsetU16SpecializedG32PSO = try context.pipeline(
+            "moe_phase1_gate_up_act_subset_u16load",
+            constants: moeConstants + g32Extra)
+        self.phase2ReduceK8G32PSO = try context.pipeline(
+            "moe_phase2_down_reduce_k8", constants: g32Extra)
+        self.phase2ReduceK8SpecializedG32PSO = try context.pipeline(
+            "moe_phase2_down_reduce_k8",
+            constants: moeConstants + g32Extra)
+        self.phase2ReduceK10G32PSO = try context.pipeline(
+            "moe_phase2_down_reduce_k10", constants: g32Extra)
+        self.phase2ReduceK10SpecializedG32PSO = try context.pipeline(
+            "moe_phase2_down_reduce_k10",
+            constants: moeConstants + g32Extra)
 
         guard let logits = context.device.makeBuffer(
-            length: 256 * MemoryLayout<Float>.stride,
+            length: Self.maxNumExperts * MemoryLayout<Float>.stride,
             options: .storageModeShared),
               let phase1Function = context.library.makeFunction(
                 name: "moe_phase1_gate_up_act_u16load") else {
@@ -147,9 +217,11 @@ final class MoE {
                                    d: UInt32,
                                    topK: UInt32,
                                    weightBits: Int = 8) {
-        precondition(d.isMultiple(of: UInt32(Quantization.groupSize)))
-        precondition(numExperts <= 256)
-        precondition(topK == UInt32(Self.maxStreamedExperts))
+        precondition(d.isMultiple(of: 32),
+                     "router hidden dim \(d) must be a multiple of 32 (supports group 32/64)")
+        precondition(numExperts <= UInt32(Self.maxNumExperts))
+        precondition(Self.supportedTopK.contains(topK),
+                     "router topK must be 8 or 10, got \(topK)")
         precondition(weightBits == 8 || weightBits == 4,
                      "router weight bits must be 8 or 4")
 
@@ -157,6 +229,7 @@ final class MoE {
         var dimension = d
         let useSpecialized = numExperts == realDecodeNumExperts
             && d == realDecodeD
+            && topK == realDecodeTopK
         let gemvPSO = weightBits == 4
             ? (useSpecialized ? routerGemvInt4SpecializedPSO : routerGemvInt4PSO)
             : (useSpecialized ? routerGemvSpecializedPSO : routerGemvPSO)
@@ -177,8 +250,18 @@ final class MoE {
         }
 
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.setComputePipelineState(
-                useSpecialized ? routerSelectK8SpecializedPSO : routerSelectK8PSO)
+            let selectPSO: MTLComputePipelineState
+            switch topK {
+            case 8:
+                selectPSO = useSpecialized
+                    ? routerSelectK8SpecializedPSO : routerSelectK8PSO
+            case 10:
+                selectPSO = useSpecialized
+                    ? routerSelectK10SpecializedPSO : routerSelectK10PSO
+            default:
+                fatalError("unreachable: topK validated above")
+            }
+            encoder.setComputePipelineState(selectPSO)
             encoder.setBuffer(routerLogits, offset: 0, index: 0)
             encoder.setBuffer(perExpertScale, offset: perExpertScaleOffset, index: 1)
             encoder.setBuffer(outIndices, offset: 0, index: 2)
@@ -226,10 +309,15 @@ final class MoE {
         var intermediate = f
         var expertCount = topK
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
-        encoder.setComputePipelineState(
-            useRealDecodeConstants(d: d, f: f)
-                ? phase1U16SpecializedPSO
-                : phase1U16PSO)
+        let g32 = routedGroupSize == 32
+        let specialized = useRealDecodeConstants(d: d, f: f)
+        let pso1: MTLComputePipelineState
+        if g32 {
+            pso1 = specialized ? phase1U16SpecializedG32PSO : phase1U16G32PSO
+        } else {
+            pso1 = specialized ? phase1U16SpecializedPSO : phase1U16PSO
+        }
+        encoder.setComputePipelineState(pso1)
         encoder.setBuffer(routedArgBuffer, offset: 0, index: 0)
         for buffer in routedBlobs { encoder.useResource(buffer, usage: .read) }
         var offsets = routedOffsets
@@ -267,10 +355,17 @@ final class MoE {
         var expertCount = topK
         var active = activeCount
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
-        encoder.setComputePipelineState(
-            useRealDecodeConstants(d: d, f: f)
-                ? phase1SubsetU16SpecializedPSO
-                : phase1SubsetU16PSO)
+        let g32Subset = routedGroupSize == 32
+        let specializedSubset = useRealDecodeConstants(d: d, f: f)
+        let psoSubset: MTLComputePipelineState
+        if g32Subset {
+            psoSubset = specializedSubset
+                ? phase1SubsetU16SpecializedG32PSO : phase1SubsetU16G32PSO
+        } else {
+            psoSubset = specializedSubset
+                ? phase1SubsetU16SpecializedPSO : phase1SubsetU16PSO
+        }
+        encoder.setComputePipelineState(psoSubset)
         encoder.setBuffer(routedArgBuffer, offset: 0, index: 0)
         for slot in activeSlotIndices {
             encoder.useResource(routedBlobs[Int(slot)], usage: .read)
@@ -306,11 +401,24 @@ final class MoE {
         validate(routedBlobs: routedBlobs, topK: topK)
         var dimension = d
         var intermediate = f
+        var expertCount = topK
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
-        encoder.setComputePipelineState(
-            useRealDecodeConstants(d: d, f: f)
-                ? phase2ReduceK8SpecializedPSO
-                : phase2ReduceK8PSO)
+        let specialized = useRealDecodeConstants(d: d, f: f, topK: topK)
+        let g32Reduce = routedGroupSize == 32
+        switch topK {
+        case 8:
+            encoder.setComputePipelineState(
+                g32Reduce
+                    ? (specialized ? phase2ReduceK8SpecializedG32PSO : phase2ReduceK8G32PSO)
+                    : (specialized ? phase2ReduceK8SpecializedPSO : phase2ReduceK8PSO))
+        case 10:
+            encoder.setComputePipelineState(
+                g32Reduce
+                    ? (specialized ? phase2ReduceK10SpecializedG32PSO : phase2ReduceK10G32PSO)
+                    : (specialized ? phase2ReduceK10SpecializedPSO : phase2ReduceK10PSO))
+        default:
+            fatalError("unreachable: topK validated")
+        }
         encoder.setBuffer(routedArgBuffer, offset: 0, index: 0)
         for buffer in routedBlobs { encoder.useResource(buffer, usage: .read) }
         var offsets = routedOffsets
@@ -321,14 +429,22 @@ final class MoE {
         encoder.setBuffer(y, offset: 0, index: 5)
         encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 6)
         encoder.setBytes(&intermediate, length: MemoryLayout<UInt32>.stride, index: 7)
+        // The k10 kernel binds the top-k count at index 8 (k8 hardcodes 8
+        // and leaves the slot unset).
+        if topK == 10 {
+            encoder.setBytes(&expertCount, length: MemoryLayout<UInt32>.stride, index: 8)
+        }
+        // k8 uses 8 SIMDs (256 threads); k10 uses 10 SIMDs (320 threads).
+        let threadsPerTG = topK == 10 ? 320 : 256
         encoder.dispatchThreadgroups(
             MTLSize(width: Int(d), height: 1, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+            threadsPerThreadgroup: MTLSize(width: threadsPerTG, height: 1, depth: 1))
         encoder.endEncoding()
     }
 
     private func validate(routedBlobs: [MTLBuffer], topK: UInt32) {
-        precondition(topK == UInt32(Self.maxStreamedExperts))
+        precondition(Self.supportedTopK.contains(topK),
+                     "MoE topK must be 8 or 10, got \(topK)")
         precondition(routedBlobs.count == Int(topK))
     }
 
@@ -342,5 +458,9 @@ final class MoE {
 
     private func useRealDecodeConstants(d: UInt32, f: UInt32) -> Bool {
         d == realDecodeD && f == realDecodeF
+    }
+
+    private func useRealDecodeConstants(d: UInt32, f: UInt32, topK: UInt32) -> Bool {
+        d == realDecodeD && f == realDecodeF && topK == realDecodeTopK
     }
 }

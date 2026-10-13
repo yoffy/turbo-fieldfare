@@ -36,7 +36,8 @@ public final class SharedExpertInt4 {
                        y: MTLBuffer, yOffset: Int = 0,
                        scratchGate: MTLBuffer, scratchGateOffset: Int = 0,
                        scratchUp: MTLBuffer, scratchUpOffset: Int = 0,
-                       scratchAct: MTLBuffer, scratchActOffset: Int = 0) throws {
+                       scratchAct: MTLBuffer, scratchActOffset: Int = 0,
+                       groupSize: Int = 64) throws {
         guard gate.rows == up.rows, gate.cols == up.cols,
               down.rows == gate.cols, down.cols == gate.rows else {
             throw SharedExpertError.dimensionMismatch(
@@ -64,14 +65,16 @@ public final class SharedExpertInt4 {
                     biases: gate.biases, biasesOffset: gate.biasesOffset,
                     x: x, xOffset: xOffset,
                     y: scratchGate, yOffset: scratchGateOffset,
-                    m: gate.rows, n: gate.cols)
+                    m: gate.rows, n: gate.cols,
+                    groupSize: groupSize)
         int4.encode(commandBuffer: cb,
                     weights: up.weights, weightsOffset: up.weightsOffset,
                     scales: up.scales, scalesOffset: up.scalesOffset,
                     biases: up.biases, biasesOffset: up.biasesOffset,
                     x: x, xOffset: xOffset,
                     y: scratchUp, yOffset: scratchUpOffset,
-                    m: up.rows, n: up.cols)
+                    m: up.rows, n: up.cols,
+                    groupSize: groupSize)
 
         guard let encoder = cb.makeComputeCommandEncoder() else { return }
         encoder.setComputePipelineState(geluMulPSO)
@@ -91,7 +94,8 @@ public final class SharedExpertInt4 {
                     biases: down.biases, biasesOffset: down.biasesOffset,
                     x: scratchAct, xOffset: scratchActOffset,
                     y: y, yOffset: yOffset,
-                    m: down.rows, n: down.cols)
+                    m: down.rows, n: down.cols,
+                    groupSize: groupSize)
     }
 }
 
@@ -124,14 +128,16 @@ public final class SharedExpertRuntime {
                        y: MTLBuffer, yOffset: Int = 0,
                        scratchGate: MTLBuffer, scratchGateOffset: Int = 0,
                        scratchUp: MTLBuffer, scratchUpOffset: Int = 0,
-                       scratchAct: MTLBuffer, scratchActOffset: Int = 0) throws {
+                       scratchAct: MTLBuffer, scratchActOffset: Int = 0,
+                       groupSize: Int = 64) throws {
         switch implementation {
         case .int4(let runtime):
             try runtime.encode(commandBuffer: commandBuffer, x: x, xOffset: xOffset,
                                gate: gate, up: up, down: down, y: y, yOffset: yOffset,
                                scratchGate: scratchGate, scratchGateOffset: scratchGateOffset,
                                scratchUp: scratchUp, scratchUpOffset: scratchUpOffset,
-                               scratchAct: scratchAct, scratchActOffset: scratchActOffset)
+                               scratchAct: scratchAct, scratchActOffset: scratchActOffset,
+                               groupSize: groupSize)
         case .int8(let runtime):
             try runtime.encode(commandBuffer: commandBuffer, x: x, xOffset: xOffset,
                                gate: gate, up: up, down: down, y: y, yOffset: yOffset,

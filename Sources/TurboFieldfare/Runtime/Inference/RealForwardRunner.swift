@@ -226,6 +226,37 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     /// BF16 ones over [numExperts]; neutral per_expert_scale when the router
     /// has no auxiliary scale tensors.
     private let onesPerExpertScale: MTLBuffer?
+    // Qwen 3.8 decode state (nil on other families). Hyper-connection stream
+    // buffers are [hc * hidden] FP16; QSA pooled keys persist per QSA layer
+    // across tokens ([maxBlocks, indexerHeadDim] FP16, position-indexed).
+    private let q38: Qwen38Kernels?
+    private let pleReader: PleShardReader?
+    private let q38Hyper: MTLBuffer?
+    private let q38HyperNormed: MTLBuffer?
+    private let q38Low: MTLBuffer?
+    private let q38Mix: MTLBuffer?
+    private let q38AttnIn: MTLBuffer?
+    private let q38MlpIn: MTLBuffer?
+    private let q38Inj: MTLBuffer?
+    private let q38IdxQK: MTLBuffer?
+    private let q38IdxQ: MTLBuffer?
+    private let q38PooledKeys: [MTLBuffer]
+    private let q38Scores: MTLBuffer?
+    private let q38Sel: MTLBuffer?
+    private let q38CompactK: MTLBuffer?
+    private let q38CompactV: MTLBuffer?
+    private let q38PleEmbed: MTLBuffer?
+    private let q38PleKey: MTLBuffer?
+    private let q38PleValue: MTLBuffer?
+    private let q38PleQuery: MTLBuffer?
+    private let q38PleDots: MTLBuffer?
+    private let q38PleGate: MTLBuffer?
+    private let q38PleGated: MTLBuffer?
+    private let q38PleConvOut: MTLBuffer?
+    private let q38PleConvState: MTLBuffer?
+    private let q38PleEos: Int32
+    private var q38PleHistory: [Int32]
+    private var q38IdxTails: [[Float]]
     private var prefillChunkState = PrefillChunkCommitState()
     private var prefillScratch: PrefillChunkScratchBuffers?
 
@@ -257,7 +288,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     private var rdadviseAdaptivePosition: Int = -1
     private var rdadviseAdaptivePositionBytes: UInt64 = 0
     public init(model: Model, context: MetalContext, maxContext: Int,
-                runtimeConfiguration: RuntimeConfiguration = .production) throws {
+                runtimeConfiguration: RuntimeConfiguration = .production,
+                pleEosTokenId: Int = 248046) throws {
         self.model = model
         self.ctx = context
         self.cfg = model.config
@@ -301,7 +333,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                  siluActivation: silu,
                                  specializedD: UInt32(cfg.hiddenSize),
                                  specializedF: UInt32(cfg.moeIntermediateSize),
-                                 specializedNumExperts: UInt32(cfg.numExperts))
+                                 specializedNumExperts: UInt32(cfg.numExperts),
+                                 specializedTopK: UInt32(cfg.topKExperts),
+                                 routedGroupSize: model.routedExpertGroupSize)
         self.fusionHead = try LMHeadChainInt4(context: context,
                                               maxD: cfg.hiddenSize,
                                               maxVocab: cfg.vocabSize)
@@ -337,7 +371,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         self.elementwise = needsElementwise ? try Elementwise(context: context) : nil
         if cfg.hasLinearAttentionLayers {
             self.gdn = try GDN(context: context, config: cfg.linearAttention,
-                               specializedHiddenSize: cfg.hiddenSize)
+                               specializedHiddenSize: cfg.hiddenSize,
+                               projGroupSize: model.attentionGroupSize)
             self.gdnState = try GDNStateManager(device: context.device, config: cfg)
         } else {
             self.gdn = nil
@@ -425,6 +460,96 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         }
         self.sharedScalarGateBuf = cfg.sharedExpertGated ? try buf(1) : nil
 
+        // Qwen 3.8 decode scratch — allocated once here, never in the hot path.
+        if cfg.family == .qwen38 {
+            let hc = cfg.hcCount
+            let hcHidden = hc * D
+            let lowrank = cfg.hcLowrank
+            let idxDim = cfg.indexerHeadDim
+            let idxHeads = cfg.indexerNHeads
+            let idxKvHeads = cfg.indexerKvHeads
+            let idxRows = idxHeads * idxDim + idxKvHeads * idxDim
+            let compress = max(cfg.indexerCompressRatio, 1)
+            let maxBlocks = (maxContext + compress - 1) / compress
+            let selMax = cfg.indexerBudget + compress
+            let blockTopK = cfg.indexerBudget / compress
+            let compactRows = blockTopK * compress + compress
+            let kvElems = cfg.numFullKVHeads * cfg.fullHeadDim
+            // PLE short-conv state: (kernel - 1) * dilation rows of the
+            // gated values. Production geometry (k=4, dilation=ngram_size=3)
+            // holds 9 rows; the kernel takes the lengths as parameters.
+            let pleConvStateLen = 9
+            self.q38 = try Qwen38Kernels(context: context)
+            self.pleReader = try PleShardReader(directoryURL: model.directoryURL)
+            self.q38Hyper = try buf(hcHidden)
+            self.q38HyperNormed = try buf(hcHidden)
+            self.q38Low = try buf(lowrank)
+            self.q38Mix = try buf(hcHidden)
+            self.q38AttnIn = try buf(D)
+            self.q38MlpIn = try buf(D)
+            self.q38Inj = try buf(hc)
+            self.q38IdxQK = try buf(idxRows)
+            self.q38IdxQ = try buf(idxHeads * idxDim)
+            var pooled: [MTLBuffer] = []
+            pooled.reserveCapacity(cfg.numLayers)
+            for L in 0..<cfg.numLayers {
+                if cfg.layerIsFull(L) {
+                    pooled.append(try buf(maxBlocks * idxDim))
+                } else {
+                    // Non-QSA layers carry no pooled index keys; keep the
+                    // array layer-indexed with a 1-element placeholder.
+                    pooled.append(try buf(1))
+                }
+            }
+            self.q38PooledKeys = pooled
+            self.q38Scores = try buf(maxBlocks, MemoryLayout<Float>.stride)
+            self.q38Sel = try buf(selMax, MemoryLayout<UInt32>.stride)
+            self.q38CompactK = try buf(compactRows * kvElems)
+            self.q38CompactV = try buf(compactRows * kvElems)
+            self.q38PleEmbed = try buf(cfg.pleEmbedDim)
+            self.q38PleKey = try buf(hcHidden)
+            self.q38PleValue = try buf(D)
+            self.q38PleQuery = try buf(hcHidden)
+            self.q38PleDots = try buf(hc, MemoryLayout<Float>.stride)
+            self.q38PleGate = try buf(hc, MemoryLayout<Float>.stride)
+            self.q38PleGated = try buf(hcHidden)
+            self.q38PleConvOut = try buf(hcHidden)
+            self.q38PleConvState = try buf(pleConvStateLen * hcHidden)
+            memset(self.q38PleConvState!.contents(), 0, self.q38PleConvState!.length)
+            self.q38PleEos = Int32(pleEosTokenId)
+            self.q38PleHistory = []
+            self.q38IdxTails = [[Float]](repeating: [], count: cfg.numLayers)
+        } else {
+            self.q38 = nil
+            self.pleReader = nil
+            self.q38Hyper = nil
+            self.q38HyperNormed = nil
+            self.q38Low = nil
+            self.q38Mix = nil
+            self.q38AttnIn = nil
+            self.q38MlpIn = nil
+            self.q38Inj = nil
+            self.q38IdxQK = nil
+            self.q38IdxQ = nil
+            self.q38PooledKeys = []
+            self.q38Scores = nil
+            self.q38Sel = nil
+            self.q38CompactK = nil
+            self.q38CompactV = nil
+            self.q38PleEmbed = nil
+            self.q38PleKey = nil
+            self.q38PleValue = nil
+            self.q38PleQuery = nil
+            self.q38PleDots = nil
+            self.q38PleGate = nil
+            self.q38PleGated = nil
+            self.q38PleConvOut = nil
+            self.q38PleConvState = nil
+            self.q38PleEos = 0
+            self.q38PleHistory = []
+            self.q38IdxTails = []
+        }
+
         func sharedProj(_ view: TensorView, rows: UInt32, cols: UInt32) -> SharedExpertProjection {
             SharedExpertProjection(weights: view.buffer,
                                  scales: view.buffer,
@@ -507,6 +632,14 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         kv?.reset()
         gdnState?.reset()
         resetTransientState()
+        // Qwen 3.8: PLE token history, indexer raw tails, and the PLE short-
+        // conv state restart. Pooled index keys are position-indexed, so stale
+        // rows are simply overwritten as blocks complete again.
+        q38PleHistory = []
+        q38IdxTails = [[Float]](repeating: [], count: cfg.numLayers)
+        if let st = q38PleConvState {
+            memset(st.contents(), 0, st.length)
+        }
     }
 
     public var continuationPosition: Int {
@@ -638,6 +771,29 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         }
         guard !tokens.isEmpty else {
             return PrefillResult(newPosition: startPosition, seed: .logitsWritten)
+        }
+
+        // Qwen 3.8 correctness-first staging: chunked prefill advances the
+        // same per-token state machine as decode (KV + GDN recurrence + PLE
+        // history + indexer pools), one token at a time. Batched QSA/hyper
+        // prefill kernels are a follow-up optimization; state equivalence
+        // with pure decode holds by construction.
+        if cfg.family == .qwen38 {
+            var pos = startPosition
+            let lastIndex = tokens.index(tokens.startIndex, offsetBy: tokens.count - 1)
+            for idx in tokens.indices {
+                let isLast = (idx == lastIndex)
+                try await produceTokenQwen38(
+                    token: tokens[idx], position: pos, into: logits,
+                    emitHead: isLast,
+                    outputMode: isLast ? outputMode : .greedyIfAvailable)
+                pos += 1
+                onProgress(pos - startPosition)
+            }
+            if outputMode == .greedyIfAvailable, useFusedGreedyHead {
+                return PrefillResult(newPosition: pos, seed: .greedyToken(lastGreedyToken))
+            }
+            return PrefillResult(newPosition: pos, seed: .logitsWritten)
         }
 
         let scratch = try ensurePrefillScratch(config: config)
@@ -1626,6 +1782,14 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                               into logits: MTLBuffer,
                               emitHead: Bool,
                               outputMode: PrefillOutputMode) async throws {
+        // Qwen 3.8 runs the hyper-connection / QSA / PLE graph instead of the
+        // Gemma/Qwen3.5-3.6 residual graph below.
+        if cfg.family == .qwen38 {
+            try await produceTokenQwen38(token: token, position: position,
+                                         into: logits, emitHead: emitHead,
+                                         outputMode: outputMode)
+            return
+        }
         let kvPosition = kv?.position ?? 0
         guard kvPosition == position else {
             throw PrefillError.prefillCursorMismatch(
@@ -2175,7 +2339,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     /// Gated-DeltaNet linear attention (layer mask 2), one decode step.
     /// Reads `normed`, updates the layer's recurrent state + conv tail in
     /// place, and leaves the attention-branch output in `oOut`.
-    private func encodeLinearAttentionDecode(_ cb: MTLCommandBuffer, layer L: Int) throws {
+    private func encodeLinearAttentionDecode(_ cb: MTLCommandBuffer, layer L: Int,
+                                             from input: MTLBuffer? = nil,
+                                             outGroupSize: Int = 64) throws {
         guard let gdn, let gdnState, let gdnQKVRaw, let gdnConvOut,
               let gdnZ, let gdnA, let gdnB, let gdnY, let gdnOut else {
             preconditionFailure("linear-attention layer without GDN kernels")
@@ -2195,7 +2361,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         // One dispatch over the concatenated qkv/z/a/b row space instead of four
         // separate GEMVs (a and b were 4 threadgroups each).
         gdn.encodeInputProjections(commandBuffer: cb,
-                                   x: normed,
+                                   x: input ?? normed,
                                    qkv: qkvW, qkvOut: gdnQKVRaw,
                                    z: zW, zOut: gdnZ,
                                    a: aW, aOut: gdnA,
@@ -2227,7 +2393,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     weights: outW.buffer, weightsOffset: Int(outW.offset),
                     scales: outW.buffer, scalesOffset: Int(outW.scaleOffset),
                     biases: outW.buffer, biasesOffset: Int(outW.biasOffset),
-                    x: gdnOut, y: oOut, m: D, n: UInt32(la.valueDim))
+                    x: gdnOut, y: oOut, m: D, n: UInt32(la.valueDim),
+                    groupSize: outGroupSize)
     }
 
     /// Scalar shared-expert gate GEMV (`mlp.shared_expert_gate`, [1, D]).
@@ -2366,6 +2533,704 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     scales: o.buffer, scalesOffset: Int(o.scaleOffset),
                     biases: o.buffer, biasesOffset: Int(o.biasOffset),
                     x: attnOut, y: oOut, m: D, n: qDim)
+    }
+
+
+    // MARK: - Qwen 3.8 decode (hyper-connection / QSA / PLE)
+
+    @inline(__always)
+    private static func q38F16(_ x: Float) -> UInt16 { Float16(x).bitPattern }
+
+    @inline(__always)
+    private static func q38F32(_ b: UInt16) -> Float { Float(Float16(bitPattern: b)) }
+
+    /// One gated-residual mix (`Qwen4ExpTextGatedResidual`): grouped (1+w)
+    /// norm, low-rank down/up mixer with silu/sigmoid, branch-mean. With
+    /// `injectW != nil` also emits `2*sigmoid(block_inject/ hc)` injection
+    /// weights. All GEMVs read the attention-slot group width (base 4-bit).
+    private func q38HyperMix(_ cb: MTLCommandBuffer,
+                             hyper: MTLBuffer,
+                             normW: TensorView,
+                             downW: TensorView,
+                             upW: TensorView,
+                             injectW: TensorView?,
+                             mixedOut: MTLBuffer,
+                             injOut: MTLBuffer?,
+                             groupSize: Int) throws {
+        guard let q38, let hyperNormed = q38HyperNormed, let low = q38Low,
+              let mix = q38Mix else {
+            preconditionFailure("qwen38 hyper-connection without scratch")
+        }
+        let D = cfg.hiddenSize
+        let hc = cfg.hcCount
+        let hcHidden = hc * D
+        let lowrank = cfg.hcLowrank
+        let eps: Float = 1e-6
+        q38.encodeNormGrouped(commandBuffer: cb,
+                              x: hyper, weight: normW.buffer,
+                              weightOffset: Int(normW.offset),
+                              out: hyperNormed, dim: UInt32(D), groups: hc,
+                              eps: eps)
+        int4.encode(commandBuffer: cb,
+                    weights: downW.buffer, weightsOffset: Int(downW.offset),
+                    scales: downW.buffer, scalesOffset: Int(downW.scaleOffset),
+                    biases: downW.buffer, biasesOffset: Int(downW.biasOffset),
+                    x: hyperNormed, y: low,
+                    m: UInt32(lowrank), n: UInt32(hcHidden),
+                    groupSize: groupSize)
+        q38.encodeSiluDiv(commandBuffer: cb, x: low, y: low,
+                          div: Float(hc), count: lowrank)
+        int4.encode(commandBuffer: cb,
+                    weights: upW.buffer, weightsOffset: Int(upW.offset),
+                    scales: upW.buffer, scalesOffset: Int(upW.scaleOffset),
+                    biases: upW.buffer, biasesOffset: Int(upW.biasOffset),
+                    x: low, y: mix,
+                    m: UInt32(hcHidden), n: UInt32(lowrank),
+                    groupSize: groupSize)
+        q38.encodeSigmoid(commandBuffer: cb, x: mix, y: mix, count: hcHidden)
+        q38.encodeMixMean(commandBuffer: cb, mix: mix, normed: hyperNormed,
+                          mixed: mixedOut, d: D, h: hc)
+        if let injW, let injOut {
+            int4.encode(commandBuffer: cb,
+                        weights: injW.buffer, weightsOffset: Int(injW.offset),
+                        scales: injW.buffer, scalesOffset: Int(injW.scaleOffset),
+                        biases: injW.buffer, biasesOffset: Int(injW.biasOffset),
+                        x: hyperNormed, y: injOut,
+                        m: UInt32(hc), n: UInt32(hcHidden),
+                        groupSize: groupSize)
+            q38.encodeSigmoid2Div(commandBuffer: cb, x: injOut, y: injOut,
+                                  div: Float(hc), count: hc)
+        }
+    }
+
+    /// CPU half of the QSA indexer for one decode step. Reads back the
+    /// `index_qk_proj` row (shared buffer, no copy), splits query/raw key,
+    /// applies the reference layernorm + RoPE on CPU, appends the raw key to
+    /// the layer tail, and finalizes newly completed `compress`-token blocks
+    /// straight into the GPU pooled-key buffer (shared write). Returns the
+    /// completed-block count visible to this query.
+    private func q38IndexerPost(layer L: Int, position p: Int) throws -> Int {
+        guard let idxQK = q38IdxQK, let idxQ = q38IdxQ else {
+            preconditionFailure("qwen38 indexer without scratch")
+        }
+        let idxDim = cfg.indexerHeadDim
+        let idxHeads = cfg.indexerNHeads
+        let compress = cfg.indexerCompressRatio
+        let rotaryDim = Int(Double(cfg.headDim) * cfg.partialRotaryFactor)
+        let eps: Float = 1e-6
+        // Read back the projected row (FP16 shared buffer).
+        let src = idxQK.contents().assumingMemoryBound(to: UInt16.self)
+        var qk = [Float](repeating: 0, count: (idxHeads + cfg.indexerKvHeads) * idxDim)
+        for i in 0..<qk.count { qk[i] = Self.q38F32(src[i]) }
+        let qFlat = Array(qk[0..<(idxHeads * idxDim)])
+        let rawKey = Array(qk[(idxHeads * idxDim)...])
+        // Query layernorm (shared [headDim] weight) + RoPE at p.
+        let qNormW = try model.indexerQNorm(layer: L)
+        let qw = qNormW.buffer.contents().advanced(by: Int(qNormW.offset))
+            .assumingMemoryBound(to: UInt16.self)
+        var qWeight = [Float](repeating: 0, count: idxDim)
+        for i in 0..<idxDim { qWeight[i] = Quantization.bf16ToFloat(qw[i]) }
+        var qHeads: [[Float]] = []
+        qHeads.reserveCapacity(idxHeads)
+        for h in 0..<idxHeads {
+            let row = Array(qFlat[(h * idxDim)..<((h + 1) * idxDim)])
+            let normed = Qwen38Reference.rmsNorm(row, weight: qWeight, eps: eps)
+            qHeads.append(Qwen38Reference.applyRopeNeoxCPU(
+                normed, position: p, headDim: idxDim, rotaryDim: rotaryDim,
+                theta: cfg.ropeTheta))
+        }
+        // Publish the query heads to the GPU score buffer input.
+        let qDst = idxQ.contents().assumingMemoryBound(to: UInt16.self)
+        for h in 0..<idxHeads {
+            for d in 0..<idxDim {
+                qDst[h * idxDim + d] = Self.q38F16(qHeads[h][d])
+            }
+        }
+        // Tail append + block finalization (mean -> k layernorm -> RoPE at
+        // the group start -> shared write into the pooled cache).
+        var tail = q38IdxTails[L]
+        tail.append(contentsOf: rawKey)
+        let visible = p + 1
+        let completed = visible / compress
+        let kNormW = try model.indexerKNorm(layer: L)
+        let kw = kNormW.buffer.contents().advanced(by: Int(kNormW.offset))
+            .assumingMemoryBound(to: UInt16.self)
+        var kWeight = [Float](repeating: 0, count: idxDim)
+        for i in 0..<idxDim { kWeight[i] = Quantization.bf16ToFloat(kw[i]) }
+        let poolDst = q38PooledKeys[L].contents().assumingMemoryBound(to: UInt16.self)
+        while tail.count >= compress * idxDim {
+            let blockRows = Array(tail.prefix(compress * idxDim))
+            tail.removeFirst(compress * idxDim)
+            var mean = [Float](repeating: 0, count: idxDim)
+            for t in 0..<compress {
+                for d in 0..<idxDim { mean[d] += blockRows[t * idxDim + d] }
+            }
+            for d in 0..<idxDim { mean[d] /= Float(compress) }
+            let normed = Qwen38Reference.rmsNorm(mean, weight: kWeight, eps: eps)
+            // Group-start position of the block just completed.
+            let blockIndex = (visible - tail.count / idxDim) / compress - 1
+            let start = blockIndex * compress
+            let rotated = Qwen38Reference.applyRopeNeoxCPU(
+                normed, position: start, headDim: idxDim, rotaryDim: rotaryDim,
+                theta: cfg.ropeTheta)
+            for d in 0..<idxDim {
+                poolDst[blockIndex * idxDim + d] = Self.q38F16(rotated[d])
+            }
+        }
+        q38IdxTails[L] = tail
+        return completed
+    }
+
+    /// CPU top-k over the GPU block scores. Reads back `completed` FP32
+    /// scores (shared buffer), runs the reference block selection + tail
+    /// passthrough, and publishes the selected token indices. Short contexts
+    /// (no complete block) return the dense visible prefix, matching exact
+    /// attention by construction.
+    private func q38SelectTokens(layer L: Int, position p: Int,
+                                 completed: Int) -> Int {
+        guard let scores = q38Scores, let sel = q38Sel else {
+            preconditionFailure("qwen38 QSA without scratch")
+        }
+        let compress = cfg.indexerCompressRatio
+        let blockTopK = cfg.indexerBudget / compress
+        let visible = Array(0...(p))
+        let selected: [Int]
+        if completed > 0 {
+            let sPtr = scores.contents().assumingMemoryBound(to: Float.self)
+            var blockScores = [Float](repeating: 0, count: completed)
+            for b in 0..<completed { blockScores[b] = sPtr[b] }
+            selected = Qwen38Reference.qsaSelectTokens(
+                visible: visible, blockScores: blockScores,
+                compress: compress, blockTopK: blockTopK)
+        } else {
+            selected = visible
+        }
+        let dst = sel.contents().assumingMemoryBound(to: UInt32.self)
+        for (i, tok) in selected.enumerated() { dst[i] = UInt32(tok) }
+        return selected.count
+    }
+
+    /// PLE injection for the PLE layer: CPU n-gram ids + SSD row reads +
+    /// shared upload, then GPU key/value projections, gated mix, dilated
+    /// short conv, and add-back into the hyper stream.
+    private func q38PLE(token: Int32, pleLayer L: Int) throws {
+        guard let q38, let pleReader, let elementwise,
+              let pleEmbed = q38PleEmbed, let pleKey = q38PleKey,
+              let pleValue = q38PleValue, let pleQuery = q38PleQuery,
+              let pleDots = q38PleDots, let pleGate = q38PleGate,
+              let pleGated = q38PleGated, let pleConvOut = q38PleConvOut,
+              let pleConvState = q38PleConvState, let hyper = q38Hyper else {
+            preconditionFailure("qwen38 PLE without scratch")
+        }
+        let D = cfg.hiddenSize
+        let hc = cfg.hcCount
+        let hcHidden = hc * D
+        let ngramSize = cfg.pleNgramSize
+        let headsPerNgram = cfg.pleHeadsPerNgram
+        let ngramHeads = (ngramSize - 1) * headsPerNgram
+        let eps: Float = 1e-6
+        let attnGroup = model.attentionGroupSize
+        // CPU: n-gram row ids for the current token from the trailing
+        // context window (EOS-padded at stream start, like the reference's
+        // conv_states[2] init).
+        let contextLen = ngramSize - 1
+        var window = q38PleHistory.suffix(contextLen).map { Int($0) }
+        while window.count < contextLen { window.insert(Int(q38PleEos), at: 0) }
+        window.append(Int(token))
+        let multView = try model.pleMultipliers(layer: L)
+        let offView = try model.pleHeadsOffsets(layer: L)
+        let vszView = try model.pleHeadsVocabSizes(layer: L)
+        let multPtr = multView.buffer.contents().advanced(by: Int(multView.offset))
+            .assumingMemoryBound(to: UInt64.self)
+        let offPtr = offView.buffer.contents().advanced(by: Int(offView.offset))
+            .assumingMemoryBound(to: Int64.self)
+        let vszPtr = vszView.buffer.contents().advanced(by: Int(vszView.offset))
+            .assumingMemoryBound(to: Int64.self)
+        let multipliers = (0..<ngramSize).map { multPtr[$0] }
+        let headOffsets = (0..<ngramHeads).map { Int(offPtr[$0]) }
+        let headVocabSizes = (0..<ngramHeads).map { Int(vszPtr[$0]) }
+        let rows = Qwen38Reference.ngramRowIds(
+            history: window, seqLen: 1, ngramSize: ngramSize,
+            headsPerNgram: headsPerNgram, multipliers: multipliers,
+            headVocabSizes: headVocabSizes, headOffsets: headOffsets,
+            eosId: Int(q38PleEos))
+        let rps = try pleReader.rowsPerShard
+        // SSD row reads (one per head) + dequant + shared upload.
+        let embDst = pleEmbed.contents().assumingMemoryBound(to: UInt16.self)
+        let headDim = cfg.pleEmbedDim / ngramHeads
+        for h in 0..<ngramHeads {
+            let vec = try pleReader.readRow(globalRow: rows[0][h], rowsPerShard: rps)
+            precondition(vec.count == headDim)
+            for d in 0..<headDim {
+                embDst[h * headDim + d] = Self.q38F16(vec[d])
+            }
+        }
+        // GPU compose.
+        let keyW = try model.pleKeyProj(layer: L)
+        let valW = try model.pleValueProj(layer: L)
+        let convW = try model.pleConv1d(layer: L)
+        let nConvW = try model.pleNormConv(layer: L)
+        let nKeyW = try model.pleNormKey(layer: L)
+        let nQueryW = try model.pleNormQuery(layer: L)
+        runSync { cb in
+            self.int4.encode(commandBuffer: cb,
+                             weights: keyW.buffer, weightsOffset: Int(keyW.offset),
+                             scales: keyW.buffer, scalesOffset: Int(keyW.scaleOffset),
+                             biases: keyW.buffer, biasesOffset: Int(keyW.biasOffset),
+                             x: pleEmbed, y: pleKey,
+                             m: UInt32(hcHidden), n: UInt32(cfg.pleEmbedDim),
+                             groupSize: attnGroup)
+            self.int4.encode(commandBuffer: cb,
+                             weights: valW.buffer, weightsOffset: Int(valW.offset),
+                             scales: valW.buffer, scalesOffset: Int(valW.scaleOffset),
+                             biases: valW.buffer, biasesOffset: Int(valW.biasOffset),
+                             x: pleEmbed, y: pleValue,
+                             m: UInt32(D), n: UInt32(cfg.pleEmbedDim),
+                             groupSize: attnGroup)
+            q38.encodeNormGrouped(commandBuffer: cb, x: pleKey,
+                                  weight: nKeyW.buffer,
+                                  weightOffset: Int(nKeyW.offset),
+                                  out: pleKey, dim: UInt32(D), groups: hc,
+                                  eps: eps)
+            q38.encodeNormGrouped(commandBuffer: cb, x: hyper,
+                                  weight: nQueryW.buffer,
+                                  weightOffset: Int(nQueryW.offset),
+                                  out: pleQuery, dim: UInt32(D), groups: hc,
+                                  eps: eps)
+            q38.encodeGateDot(commandBuffer: cb, key: pleKey, query: pleQuery,
+                              dots: pleDots, d: D, h: hc)
+        }
+        // CPU: signed-sqrt gate transform (4 floats, shared buffer).
+        let dotPtr = pleDots.contents().assumingMemoryBound(to: Float.self)
+        let gatePtr = pleGate.contents().assumingMemoryBound(to: Float.self)
+        for h in 0..<hc {
+            let dot = dotPtr[h]
+            let mag = sqrt(max(1e-6, abs(dot)))
+            gatePtr[h] = (dot >= 0 ? 1.0 : -1.0) * mag
+        }
+        runSync { cb in
+            q38.encodeScaleRows(commandBuffer: cb, value: pleValue,
+                                gate: pleGate, out: pleGated, d: D, h: hc)
+            q38.encodeNormGrouped(commandBuffer: cb, x: pleGated,
+                                  weight: nConvW.buffer,
+                                  weightOffset: Int(nConvW.offset),
+                                  out: pleGated, dim: UInt32(D), groups: hc,
+                                  eps: eps)
+            q38.encodeShortConvStep(
+                commandBuffer: cb, state: pleConvState, input: pleGated,
+                weight: convW.buffer, weightOffset: Int(convW.offset),
+                out: pleConvOut, channels: hcHidden, kernel: 4,
+                dilation: ngramSize, stateLen: 9)
+            elementwise.encodeResidualAdd(commandBuffer: cb,
+                                                hidden: pleGated,
+                                                delta: pleConvOut,
+                                                count: hcHidden)
+            elementwise.encodeResidualAdd(commandBuffer: cb,
+                                                hidden: hyper,
+                                                delta: pleGated,
+                                                count: hcHidden)
+        }
+    }
+
+
+
+
+    /// Qwen 3.8 per-token decode. Dataflow per token (reference:
+    /// Qwen4ExpTextModel / DecoderLayer):
+    /// embed -> repeat x4 -> [PLE add] -> per layer {attn hyper-mix ->
+    /// (GDN | QSA sparse) -> inject -> mlp hyper-mix -> MoE(top-10+shared) ->
+    /// inject} -> mixer -> head. QSA layers extend the KV cache like full
+    /// attention; GDN layers use the recurrent state. PLE history and indexer
+    /// tails are CPU-side; pooled index keys persist per QSA layer.
+    private func produceTokenQwen38(token: Int32,
+                                    position: Int,
+                                    into logits: MTLBuffer,
+                                    emitHead: Bool,
+                                    outputMode: PrefillOutputMode) async throws {
+        let kvPosition = kv?.position ?? 0
+        guard kvPosition == position else {
+            throw PrefillError.prefillCursorMismatch(
+                "produce cursor \(kvPosition) != position \(position)")
+        }
+        guard position < maxContext else {
+            throw PrefillError.prefillCursorMismatch(
+                "produce position \(position) exceeds maxContext \(maxContext)")
+        }
+        guard let q38, let elementwise, let rope,
+              let hyper = q38Hyper, let hyperNormed = q38HyperNormed,
+              let attnIn = q38AttnIn, let mlpIn = q38MlpIn,
+              let inj = q38Inj, let idxQK = q38IdxQK, let idxQ = q38IdxQ,
+              let scores = q38Scores, let sel = q38Sel,
+              let compactK = q38CompactK, let compactV = q38CompactV,
+              let qPackedScratch, let attnGateScratch,
+              let kv, let onesPerExpert = onesPerExpertScale else {
+            preconditionFailure("qwen38 decode without kernels/scratch")
+        }
+        _ = hyperNormed; _ = idxQ; _ = scores; _ = sel
+        let D = UInt32(cfg.hiddenSize)
+        let FmoE = UInt32(cfg.moeIntermediateSize)
+        let eps: Float = 1e-6
+        let attnGroup = model.attentionGroupSize
+        let sharedGroup = model.sharedExpertGroupSize
+        let hc = cfg.hcCount
+        let headDim = cfg.fullHeadDim
+        let numKV = cfg.numFullKVHeads
+        let qDim = UInt32(cfg.numHeads * headDim)
+        let kvDim = UInt32(numKV * headDim)
+        let idxDim = cfg.indexerHeadDim
+        let idxHeads = cfg.indexerNHeads
+        let idxRows = UInt32((idxHeads + cfg.indexerKvHeads) * idxDim)
+        let rotaryDim = UInt32(Double(cfg.fullHeadDim) * cfg.partialRotaryFactor)
+        let topK = UInt32(cfg.topKExperts)
+        var pendingQ38: [MTLCommandBuffer] = []
+
+        // Embed + 4-branch expand.
+        let emb = model.embedding
+        runSync { cb in
+            self.embedInt4.encode(commandBuffer: cb,
+                                  table: emb.buffer, tableOffset: Int(emb.offset),
+                                  scales: emb.buffer, scalesOffset: Int(emb.scaleOffset),
+                                  biases: emb.buffer, biasesOffset: Int(emb.biasOffset),
+                                  out: self.hidden,
+                                  tokenId: UInt32(bitPattern: token),
+                                  d: D, outScale: 1.0,
+                                  groupSize: self.model.embeddingGroupSize)
+            q38.encodeRepeat(commandBuffer: cb, x: self.hidden, y: hyper,
+                             d: self.cfg.hiddenSize, h: hc)
+        }
+
+        let pleLayer = model.pleLayer()
+        let sharedProjViews = sharedExpertProjections
+
+        for L in 0..<cfg.numLayers {
+            if let ple = pleLayer, ple == L {
+                try q38PLE(token: token, pleLayer: ple)
+            }
+            let routerW = try model.router(layer: L)
+            let isLinear = cfg.layerIsLinear(L)
+
+            if isLinear {
+                // One CB through the router: attn hyper-mix (with inject),
+                // GDN recurrence, attn inject, mlp hyper-mix (with inject).
+                let cb = ctx.queue.makeCommandBuffer()!
+                try q38HyperMix(cb, hyper: hyper,
+                                normW: try model.attnHcNorm(layer: L),
+                                downW: try model.attnHcMixDown(layer: L),
+                                upW: try model.attnHcMixUp(layer: L),
+                                injectW: try model.attnHcBlockInject(layer: L),
+                                mixedOut: attnIn, injOut: inj,
+                                groupSize: attnGroup)
+                try encodeLinearAttentionDecode(cb, layer: L, from: attnIn,
+                                                outGroupSize: attnGroup)
+                q38.encodeInjectAdd(commandBuffer: cb, hyper: hyper,
+                                    sub: oOut, inj: inj,
+                                    d: cfg.hiddenSize, h: hc)
+                try q38HyperMix(cb, hyper: hyper,
+                                normW: try model.mlpHcNorm(layer: L),
+                                downW: try model.mlpHcMixDown(layer: L),
+                                upW: try model.mlpHcMixUp(layer: L),
+                                injectW: try model.mlpHcBlockInject(layer: L),
+                                mixedOut: mlpIn, injOut: inj,
+                                groupSize: attnGroup)
+                moe.encodeRouterGemma4(
+                    commandBuffer: cb,
+                    weights: routerW.buffer, weightsOffset: Int(routerW.offset),
+                    scales: routerW.buffer, scalesOffset: Int(routerW.scaleOffset),
+                    biases: routerW.buffer, biasesOffset: Int(routerW.biasOffset),
+                    hidden: mlpIn,
+                    effectiveScale: effectiveScaleBuffers[L],
+                    perExpertScale: onesPerExpert, perExpertScaleOffset: 0,
+                    outIndices: outIndices, outWeights: outWeights,
+                    numExperts: UInt32(cfg.numExperts), d: D, topK: topK,
+                    weightBits: routerWeightBits)
+                cb.commit()
+                waitForCompletion(cb)
+            } else {
+                // CB1: attn hyper-mix (with inject), packed q/k/v, per-head
+                // norms, RoPE, indexer projection.
+                let cb1 = ctx.queue.makeCommandBuffer()!
+                try q38HyperMix(cb1, hyper: hyper,
+                                normW: try model.attnHcNorm(layer: L),
+                                downW: try model.attnHcMixDown(layer: L),
+                                upW: try model.attnHcMixUp(layer: L),
+                                injectW: try model.attnHcBlockInject(layer: L),
+                                mixedOut: attnIn, injOut: inj,
+                                groupSize: attnGroup)
+                let q = try model.qProj(layer: L)
+                let k = try model.kProj(layer: L)
+                let v = try model.vProj(layer: L)
+                let kSlot = kv.kSlot(layer: L, position: position)
+                let vSlot = kv.vSlot(layer: L, position: position)
+                fusedQKVGEMV.encode(
+                    commandBuffer: cb1,
+                    qWeights: q.buffer, qWeightsOffset: Int(q.offset),
+                    qScales: q.buffer, qScalesOffset: Int(q.scaleOffset),
+                    qBiases: q.buffer, qBiasesOffset: Int(q.biasOffset),
+                    kWeights: k.buffer, kWeightsOffset: Int(k.offset),
+                    kScales: k.buffer, kScalesOffset: Int(k.scaleOffset),
+                    kBiases: k.buffer, kBiasesOffset: Int(k.biasOffset),
+                    vWeights: v.buffer, vWeightsOffset: Int(v.offset),
+                    vScales: v.buffer, vScalesOffset: Int(v.scaleOffset),
+                    vBiases: v.buffer, vBiasesOffset: Int(v.biasOffset),
+                    x: attnIn,
+                    qOut: qPackedScratch,
+                    kOut: kSlot.buffer, kOutOffset: kSlot.offset,
+                    vOut: vSlot.buffer, vOutOffset: vSlot.offset,
+                    qRows: 2 * qDim, kvRows: kvDim, n: D,
+                    groupSize: attnGroup)
+                elementwise.encodeSplitQGate(
+                    commandBuffer: cb1, packed: qPackedScratch,
+                    q: qScratch, gate: attnGateScratch,
+                    heads: cfg.numHeads, dim: headDim)
+                let qNormW = try model.qNorm(layer: L)
+                let kNormW = try model.kNorm(layer: L)
+                rms.encodeBF16WPerHead(
+                    commandBuffer: cb1, x: qScratch,
+                    weight: qNormW.buffer, weightOffset: Int(qNormW.offset),
+                    out: qScratch, headDim: UInt32(headDim),
+                    numHeads: cfg.numHeads, eps: eps)
+                rms.encodeBF16WPerHead(
+                    commandBuffer: cb1,
+                    x: kSlot.buffer, xOffset: kSlot.offset,
+                    weight: kNormW.buffer, weightOffset: Int(kNormW.offset),
+                    out: kSlot.buffer, outOffset: kSlot.offset,
+                    headDim: UInt32(headDim), numHeads: numKV, eps: eps)
+                rope.encodeNeoxSubdim(
+                    commandBuffer: cb1, data: qScratch,
+                    position: UInt32(position),
+                    headDim: UInt32(headDim),
+                    numHeads: UInt32(cfg.numHeads),
+                    rotaryDim: rotaryDim,
+                    theta: Float(cfg.fullRopeTheta))
+                rope.encodeNeoxSubdim(
+                    commandBuffer: cb1, data: kSlot.buffer,
+                    dataOffset: kSlot.offset,
+                    position: UInt32(position),
+                    headDim: UInt32(headDim),
+                    numHeads: UInt32(numKV),
+                    rotaryDim: rotaryDim,
+                    theta: Float(cfg.fullRopeTheta))
+                let iqk = try model.indexerQKProj(layer: L)
+                int4.encode(commandBuffer: cb1,
+                            weights: iqk.buffer, weightsOffset: Int(iqk.offset),
+                            scales: iqk.buffer, scalesOffset: Int(iqk.scaleOffset),
+                            biases: iqk.buffer, biasesOffset: Int(iqk.biasOffset),
+                            x: attnIn, y: idxQK, m: idxRows, n: D,
+                            groupSize: attnGroup)
+                cb1.commit()
+                waitForCompletion(cb1)
+                // CPU: query finalize + block finalize into the pooled cache.
+                let completed = try q38IndexerPost(layer: L, position: position)
+                if completed > 0 {
+                    runSync { cb in
+                        q38.encodeBlockScore(
+                            commandBuffer: cb, q: idxQ, k: self.q38PooledKeys[L],
+                            scores: scores, headDim: idxDim, nHeads: idxHeads,
+                            blockCount: completed)
+                    }
+                }
+                // CPU: top-k + tail -> sel.
+                let selCount = q38SelectTokens(layer: L, position: position,
+                                               completed: completed)
+                // CB2: gather subset -> dense attention -> gate -> o_proj ->
+                // attn inject -> mlp hyper-mix -> router.
+                let cb2 = ctx.queue.makeCommandBuffer()!
+                let base = kv.gatherBase(layer: L)
+                q38.encodeGatherRows(commandBuffer: cb2, src: base.k, sel: sel,
+                                     dst: compactK, rowElems: Int(kvDim),
+                                     rows: selCount)
+                q38.encodeGatherRows(commandBuffer: cb2, src: base.v, sel: sel,
+                                     dst: compactV, rowElems: Int(kvDim),
+                                     rows: selCount)
+                attention.encodeFull(
+                    commandBuffer: cb2, q: qScratch,
+                    k: compactK, v: compactV, out: attnOut,
+                    headDim: UInt32(headDim),
+                    numQHeads: UInt32(cfg.numHeads),
+                    numKVHeads: UInt32(numKV),
+                    seqLen: UInt32(selCount),
+                    scale: Float(cfg.attentionScale))
+                elementwise.encodeSigmoidGateMul(
+                    commandBuffer: cb2, out: attnOut, gate: attnGateScratch,
+                    count: Int(qDim))
+                let o = try model.oProj(layer: L)
+                int4.encode(commandBuffer: cb2,
+                            weights: o.buffer, weightsOffset: Int(o.offset),
+                            scales: o.buffer, scalesOffset: Int(o.scaleOffset),
+                            biases: o.buffer, biasesOffset: Int(o.biasOffset),
+                            x: attnOut, y: oOut, m: D, n: qDim,
+                            groupSize: attnGroup)
+                q38.encodeInjectAdd(commandBuffer: cb2, hyper: hyper,
+                                    sub: oOut, inj: inj,
+                                    d: cfg.hiddenSize, h: hc)
+                try q38HyperMix(cb2, hyper: hyper,
+                                normW: try model.mlpHcNorm(layer: L),
+                                downW: try model.mlpHcMixDown(layer: L),
+                                upW: try model.mlpHcMixUp(layer: L),
+                                injectW: try model.mlpHcBlockInject(layer: L),
+                                mixedOut: mlpIn, injOut: inj,
+                                groupSize: attnGroup)
+                moe.encodeRouterGemma4(
+                    commandBuffer: cb2,
+                    weights: routerW.buffer, weightsOffset: Int(routerW.offset),
+                    scales: routerW.buffer, scalesOffset: Int(routerW.scaleOffset),
+                    biases: routerW.buffer, biasesOffset: Int(routerW.biasOffset),
+                    hidden: mlpIn,
+                    effectiveScale: effectiveScaleBuffers[L],
+                    perExpertScale: onesPerExpert, perExpertScaleOffset: 0,
+                    outIndices: outIndices, outWeights: outWeights,
+                    numExperts: UInt32(cfg.numExperts), d: D, topK: topK,
+                    weightBits: routerWeightBits)
+                cb2.commit()
+                waitForCompletion(cb2)
+            }
+
+            // Router readback -> SSD fetch (overlaps the shared expert below).
+            let idxPtr = outIndices.contents().bindMemory(to: UInt32.self,
+                                                          capacity: cfg.topKExperts)
+            var experts = [Int](repeating: 0, count: cfg.topKExperts)
+            for i in 0..<cfg.topKExperts {
+                experts[i] = min(Int(idxPtr[i]), cfg.numExperts - 1)
+            }
+            let routedOffsets = model.routedExpertOffsets(layer: L)
+            let sharedCB = ctx.queue.makeCommandBuffer()!
+            let proj = sharedProjViews[L]
+            try! shared.encode(commandBuffer: sharedCB, x: mlpIn,
+                               gate: proj.gate, up: proj.up, down: proj.down,
+                               y: h1Buf,
+                               scratchGate: denseScratchGate,
+                               scratchUp: denseScratchUp,
+                               scratchAct: denseScratchAct,
+                               groupSize: sharedGroup)
+            let gateView = proj.scalarGate!
+            if routerWeightBits == 4 {
+                int4.encode(commandBuffer: sharedCB,
+                            weights: gateView.buffer,
+                            weightsOffset: Int(gateView.offset),
+                            scales: gateView.buffer,
+                            scalesOffset: Int(gateView.scaleOffset),
+                            biases: gateView.buffer,
+                            biasesOffset: Int(gateView.biasOffset),
+                            x: mlpIn, y: sharedScalarGateBuf!,
+                            m: 1, n: D,
+                            groupSize: attnGroup)
+            } else {
+                int8ScalarGate!.encode(
+                    commandBuffer: sharedCB,
+                    weights: gateView.buffer,
+                    weightsOffset: Int(gateView.offset),
+                    scales: gateView.buffer,
+                    scalesOffset: Int(gateView.scaleOffset),
+                    biases: gateView.buffer,
+                    biasesOffset: Int(gateView.biasOffset),
+                    x: mlpIn, y: sharedScalarGateBuf!,
+                    m: 1, n: D)
+            }
+            elementwise.encodeSigmoidScalarMul(
+                commandBuffer: sharedCB, y: h1Buf,
+                gate: sharedScalarGateBuf!, count: cfg.hiddenSize)
+            sharedCB.commit()
+            if rdadviseEnabled, rdadvisePolicyMode != .off {
+                do {
+                    let estimated = try model.routedExpertAdviceByteEstimate(
+                        layer: L, missCount: experts.count)
+                    if let skipped = shouldSkipRDAdvice(
+                        position: position, requestedMisses: experts.count,
+                        estimatedBytes: estimated, canOverlapUsefulGPUWork: true) {
+                        recordRDAdvice(skipped, wallNanos: 0)
+                    } else {
+                        let tAdvice = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+                        let result = try model.adviseRoutedExperts(
+                            layer: L, experts: experts)
+                        recordRDAdvice(result,
+                                       wallNanos: clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tAdvice)
+                        updateRDAdvicePolicy(after: result, position: position)
+                    }
+                } catch {
+                    // Advice is best-effort; a failure must not fail decode.
+                }
+            }
+            let tIoStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+            let blobs = try await model.fetchRoutedExperts(layer: L, experts: experts)
+            totalIoNanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tIoStart
+            let routedBufs = blobs.map { $0.buffer }
+            let routedCB = ctx.queue.makeCommandBuffer()!
+            let argBuf = moe.makeReusedRoutedArgumentBuffer(
+                routedBlobs: routedBufs, topK: topK)
+            moe.encodeRoutedPersistentPhase1U16Load(
+                commandBuffer: routedCB, routedArgBuffer: argBuf,
+                routedBlobs: routedBufs, routedOffsets: routedOffsets,
+                x: mlpIn, acts: moeActs, d: D, f: FmoE, topK: topK)
+            moe.encodeRoutedPersistentPhase2Reduce(
+                commandBuffer: routedCB, routedArgBuffer: argBuf,
+                routedBlobs: routedBufs, routedOffsets: routedOffsets,
+                acts: moeActs, routingWeights: outWeights,
+                residual: h1Buf, y: h2Buf, d: D, f: FmoE, topK: topK)
+            q38.encodeInjectAdd(commandBuffer: routedCB, hyper: hyper,
+                                sub: h2Buf, inj: inj,
+                                d: cfg.hiddenSize, h: hc)
+            routedCB.commit()
+            pendingQ38.append(sharedCB)
+            pendingQ38.append(routedCB)
+        }
+        // Drain per-layer work (serial queue: waiting the last covers all).
+        if let last = pendingQ38.last { waitForCompletion(last) }
+        for cb in pendingQ38 {
+            if let err = cb.error { print("CB error: \(err)") }
+        }
+
+        // Mixer closes the stream (no block inject, no final norm).
+        let mixerNorm = model.mixerHcNorm
+        let mixerDown = model.mixerDown
+        let mixerUp = model.mixerUp
+        runSync { cb in
+            try! self.q38HyperMix(cb, hyper: hyper,
+                                  normW: mixerNorm,
+                                  downW: mixerDown,
+                                  upW: mixerUp,
+                                  injectW: nil, mixedOut: self.normed,
+                                  injOut: nil,
+                                  groupSize: attnGroup)
+        }
+
+        if emitHead {
+            let useFusedHeadForThisToken = useFusedGreedyHead && outputMode == .greedyIfAvailable
+            let lm = model.lmHead
+            if useFusedHeadForThisToken {
+                let tHead = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+                runSync { cb in
+                    self.fusionHead.encodeGreedyDecode(
+                        commandBuffer: cb, hidden: self.normed,
+                        normWeight: self.normed, normOffset: 0,
+                        weights: lm.buffer, weightsOffset: Int(lm.offset),
+                        scales: lm.buffer, scalesOffset: Int(lm.scaleOffset),
+                        biases: lm.buffer, biasesOffset: Int(lm.biasOffset),
+                        outToken: self.greedyTokenBuf,
+                        d: D, vocab: UInt32(self.cfg.vocabSize),
+                        rmsEps: eps, groupSize: attnGroup, skipNorm: true)
+                }
+                totalHeadFusedNanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tHead
+                lastGreedyToken = greedyTokenBuf.contents().load(as: UInt32.self)
+            } else {
+                let tHead = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+                runSync { cb in
+                    self.int4.encode(commandBuffer: cb,
+                                     weights: lm.buffer,
+                                     weightsOffset: Int(lm.offset),
+                                     scales: lm.buffer,
+                                     scalesOffset: Int(lm.scaleOffset),
+                                     biases: lm.buffer,
+                                     biasesOffset: Int(lm.biasOffset),
+                                     x: self.normed, y: logits,
+                                     m: UInt32(self.cfg.vocabSize), n: D,
+                                     groupSize: attnGroup)
+                }
+                totalHeadNanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tHead
+            }
+        }
+
+        kv.advance()
+        q38PleHistory.append(token)
     }
 
     private func runSync(_ body: (MTLCommandBuffer) -> Void) {
