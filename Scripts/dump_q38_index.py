@@ -71,7 +71,28 @@ def main() -> None:
                 vs = [bf16_to_f(struct.unpack("<H", raw[i:i + 2])[0]) for i in range(0, len(raw), 2)]
                 print(f"  bf16 first8={[round(v, 6) for v in vs]}")
 
-    # Dequant sanity: row 0 of shared_expert.gate_proj with w = q*s+b.
+    # PLE metadata: compare resident tables against reference recomputation.
+    # Expected (seed 1234, ple_layer_index 0):
+    #   multipliers [23703573157769, 20109073645365, 8052911324071]
+    #   head_vocab_sizes [20000003, 20000023, ...] (16 primes from 20000000)
+    #   head_offsets cumulative; padded 320001536; rowsPerShard128 2500012
+    with open(p, "rb") as f:
+        for t in ["language_model.model.layers.1.ple.ple_embedding.layer_multipliers",
+                  "language_model.model.layers.1.ple.ple_embedding.ngram_heads_offsets",
+                  "language_model.model.layers.1.ple.ple_embedding.ngram_heads_vocab_sizes"]:
+            e = by_name.get(t)
+            if e is None:
+                print(f"\n{t}\n  NOT FOUND")
+                continue
+            fileOff, size = e[4], e[5]
+            f.seek(fileOff)
+            raw = f.read(size)
+            n = len(raw) // 8
+            if "multipliers" in t:
+                vals = [struct.unpack("<Q", raw[i*8:(i+1)*8])[0] for i in range(n)]
+            else:
+                vals = [struct.unpack("<q", raw[i*8:(i+1)*8])[0] for i in range(n)]
+            print(f"\n{t}\n  n={n} vals={vals}")
     with open(p, "rb") as f:
         e = by_name.get(
             "language_model.model.layers.0.mlp.shared_expert.gate_proj.weight")
