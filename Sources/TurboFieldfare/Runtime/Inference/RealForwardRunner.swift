@@ -3193,6 +3193,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                             groupSize: attnGroup)
                 cb1.commit()
                 waitForCompletion(cb1)
+                if dbgQ38 && position == 0 && L == 3 {
+                    q38DebugProbe("qNormed.L3", qScratch, cfg.numHeads * headDim)
+                }
                 // CPU: query finalize + block finalize into the pooled cache.
                 let completed = try q38IndexerPost(layer: L, position: position)
                 if completed > 0 {
