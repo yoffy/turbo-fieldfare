@@ -3346,7 +3346,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             routedCB.commit()
             pendingQ38.append(sharedCB)
             pendingQ38.append(routedCB)
-            if dbgQ38 && position == 0 && L <= 3 {
+            if dbgQ38 && position == 0 {
                 waitForCompletion(routedCB)
                 q38DebugProbe("hyper.L\(L)", hyper, hc * cfg.hiddenSize)
                 q38DebugProbe("attnIn.L\(L)", attnIn, cfg.hiddenSize)
