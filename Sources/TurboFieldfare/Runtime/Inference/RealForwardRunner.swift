@@ -3343,6 +3343,102 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         }
     }
 
+    /// Full routed-MoE check (L0): CPU SwiGLU over all 10 selected experts
+    /// with real blob bytes vs GPU `h2Buf`. Validates phase-1/phase-2,
+    /// per-expert dequant, and the top-k weighted reduction. Mapping itself
+    /// is proven by refExpMap; this proves the compute.
+    private func q38DebugRefCheckRouted(mlpIn: MTLBuffer, h1: MTLBuffer,
+                                       h2: MTLBuffer, layer L: Int,
+                                       experts: [Int], blobs: [TensorView]) {
+        let f = cfg.moeIntermediateSize
+        let d = cfg.hiddenSize
+        let g = model.routedExpertGroupSize
+        let topK = cfg.topKExperts
+        guard experts.count == topK && blobs.count == topK else {
+            q38DebugDump("refRouted", "count mismatch")
+            return
+        }
+        let offs = model.routedExpertOffsets(layer: L)
+        let xPtr = mlpIn.contents().assumingMemoryBound(to: UInt16.self)
+        var x = [Float](repeating: 0, count: d)
+        for i in 0..<d { x[i] = Self.q38F32(xPtr[i]) }
+        let wPtr = outWeights.contents().assumingMemoryBound(to: UInt16.self)
+        var rw = [Float](repeating: 0, count: topK)
+        for i in 0..<topK { rw[i] = Self.q38F32(wPtr[i]) }
+        func gemv(base: UnsafeRawPointer, wOff: Int, sOff: Int, bOff: Int,
+                  rows: Int, cols: Int) -> [Float] {
+            let groups = cols / g
+            let rowBytes = cols / 2
+            var y = [Float](repeating: 0, count: rows)
+            for r in 0..<rows {
+                let wRow = base.advanced(by: wOff + r * rowBytes)
+                    .assumingMemoryBound(to: UInt8.self)
+                let sRow = base.advanced(by: sOff + r * groups * 2)
+                    .assumingMemoryBound(to: UInt16.self)
+                let bRow = base.advanced(by: bOff + r * groups * 2)
+                    .assumingMemoryBound(to: UInt16.self)
+                var packed = [UInt8](repeating: 0, count: rowBytes)
+                var sc = [UInt16](repeating: 0, count: groups)
+                var bi = [UInt16](repeating: 0, count: groups)
+                for i in 0..<rowBytes { packed[i] = wRow[i] }
+                for i in 0..<groups { sc[i] = sRow[i]; bi[i] = bRow[i] }
+                let w = Quantization.dequantizeInt4Affine(
+                    Quantization.Int4AffineRow(packed: packed, scales: sc, biases: bi),
+                    n: cols, groupSize: g)
+                var acc: Float = 0
+                for i in 0..<cols { acc += w[i] * x[i] }
+                y[r] = acc
+            }
+            return y
+        }
+        // Down proj needs a different input per expert; do it inline below.
+        let h1Ptr = h1.contents().assumingMemoryBound(to: UInt16.self)
+        var h2cpu = [Float](repeating: 0, count: d)
+        for i in 0..<d { h2cpu[i] = Self.q38F32(h1Ptr[i]) }
+        for s in 0..<topK {
+            let base = blobs[s].buffer.contents().advanced(by: Int(blobs[s].offset))
+            let go = Int(offs.gateWOff), gs = Int(offs.gateSOff), gb = Int(offs.gateBOff)
+            let uo = Int(offs.upWOff), us = Int(offs.upSOff), ub = Int(offs.upBOff)
+            let dwn = Int(offs.downWOff), ds = Int(offs.downSOff), db = Int(offs.downBOff)
+            let gv = gemv(base: base, wOff: go, sOff: gs, bOff: gb, rows: f, cols: d)
+            let uv = gemv(base: base, wOff: uo, sOff: us, bOff: ub, rows: f, cols: d)
+            var act = [Float](repeating: 0, count: f)
+            for i in 0..<f {
+                let sg = gv[i] / (1.0 + exp(-gv[i]))
+                act[i] = sg * uv[i]
+            }
+            let groupsD = f / g
+            let rowBytesD = f / 2
+            for r in 0..<d {
+                let wRow = base.advanced(by: dwn + r * rowBytesD)
+                    .assumingMemoryBound(to: UInt8.self)
+                let sRow = base.advanced(by: ds + r * groupsD * 2)
+                    .assumingMemoryBound(to: UInt16.self)
+                let bRow = base.advanced(by: db + r * groupsD * 2)
+                    .assumingMemoryBound(to: UInt16.self)
+                var packed = [UInt8](repeating: 0, count: rowBytesD)
+                var sc = [UInt16](repeating: 0, count: groupsD)
+                var bi = [UInt16](repeating: 0, count: groupsD)
+                for i in 0..<rowBytesD { packed[i] = wRow[i] }
+                for i in 0..<groupsD { sc[i] = sRow[i]; bi[i] = bRow[i] }
+                let w = Quantization.dequantizeInt4Affine(
+                    Quantization.Int4AffineRow(packed: packed, scales: sc, biases: bi),
+                    n: f, groupSize: g)
+                var acc: Float = 0
+                for i in 0..<f { acc += w[i] * act[i] }
+                h2cpu[r] += rw[s] * acc
+            }
+        }
+        let h2Ptr = h2.contents().assumingMemoryBound(to: UInt16.self)
+        var md: Float = 0, mx: Float = 0, sa: Float = 0
+        for i in 0..<d {
+            let dd = abs(h2cpu[i] - Self.q38F32(h2Ptr[i]))
+            md += dd; mx = max(mx, dd); sa += abs(h2cpu[i])
+        }
+        let rel = (md / Float(d)) / max(1e-6, sa / Float(d))
+        q38DebugDump("refRouted", "rel=\(rel) maxDiff=\(mx) \(rel < 0.08 ? "PASS" : "FAIL")")
+    }
+
     private func q38DebugProbe(_ label: String, _ buf: MTLBuffer, _ count: Int) {        let ptr = buf.contents().assumingMemoryBound(to: UInt16.self)
         var mn = Float.infinity
         var mx = -Float.infinity
@@ -4067,6 +4163,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     q38DebugRefCheckGDN(attnIn: attnIn, oOut: oOut, layer: L,
                                         position: position)
                     q38DebugRefCheckExpertMap(layer: L, experts: experts, blobs: blobs)
+                    q38DebugRefCheckRouted(mlpIn: mlpIn, h1: h1Buf, h2: h2Buf, layer: L,
+                                           experts: experts, blobs: blobs)
                     let wPtr = outWeights.contents().assumingMemoryBound(to: UInt16.self)
                     var wSum: Float = 0
                     for i in 0..<cfg.topKExperts { wSum += Self.q38F32(wPtr[i]) }
