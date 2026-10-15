@@ -3013,6 +3013,19 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             }
             let rel = (md / Float(d)) / max(1e-6, sa / Float(d))
             q38DebugDump("refQSAoOut", "rel=\(rel) maxDiff=\(mx) \(rel < 0.08 ? "PASS" : "FAIL")")
+            // Gate-only isolation: GPU post-split raw gate vs CPU strided
+            // gate. The fused-QKV check covered query rows only; gate rows
+            // (odd 256-blocks) were never verified.
+            if let ags = attnGateScratch {
+                let gp = ags.contents().assumingMemoryBound(to: UInt16.self)
+                var mdg: Float = 0, mxg: Float = 0, sag: Float = 0
+                for i in 0..<qDim {
+                    let dd = abs(gate[i] - Self.q38F32(gp[i]))
+                    mdg += dd; mxg = max(mxg, dd); sag += abs(gate[i])
+                }
+                let relg = (mdg / Float(qDim)) / max(1e-6, sag / Float(qDim))
+                q38DebugDump("refQSAgate", "rel=\(relg) maxDiff=\(mxg) \(relg < 0.05 ? "PASS" : "FAIL")")
+            }
         } catch {
             q38DebugDump("refQSA", "error \(error)")
         }
