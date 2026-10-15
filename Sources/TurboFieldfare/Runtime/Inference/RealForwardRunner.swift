@@ -3087,17 +3087,33 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     heads: cfg.numHeads, dim: headDim)
                 let qNormW = try model.qNorm(layer: L)
                 let kNormW = try model.kNorm(layer: L)
-                rms.encodeBF16WPerHead(
-                    commandBuffer: cb1, x: qScratch,
-                    weight: qNormW.buffer, weightOffset: Int(qNormW.offset),
-                    out: qScratch, headDim: UInt32(headDim),
-                    numHeads: cfg.numHeads, eps: eps)
-                rms.encodeBF16WPerHead(
-                    commandBuffer: cb1,
-                    x: kSlot.buffer, xOffset: kSlot.offset,
-                    weight: kNormW.buffer, weightOffset: Int(kNormW.offset),
-                    out: kSlot.buffer, outOffset: kSlot.offset,
-                    headDim: UInt32(headDim), numHeads: numKV, eps: eps)
+                // Qwen 3.8 Q/K norms are zeros-init (1 + w); older families
+                // are ones-init (w). The 1-centered kernel is QSA-only.
+                if cfg.family == .qwen38 {
+                    rms.encodeOnePlusBF16WPerHead(
+                        commandBuffer: cb1, x: qScratch,
+                        weight: qNormW.buffer, weightOffset: Int(qNormW.offset),
+                        out: qScratch, headDim: UInt32(headDim),
+                        numHeads: cfg.numHeads, eps: eps)
+                    rms.encodeOnePlusBF16WPerHead(
+                        commandBuffer: cb1,
+                        x: kSlot.buffer, xOffset: kSlot.offset,
+                        weight: kNormW.buffer, weightOffset: Int(kNormW.offset),
+                        out: kSlot.buffer, outOffset: kSlot.offset,
+                        headDim: UInt32(headDim), numHeads: numKV, eps: eps)
+                } else {
+                    rms.encodeBF16WPerHead(
+                        commandBuffer: cb1, x: qScratch,
+                        weight: qNormW.buffer, weightOffset: Int(qNormW.offset),
+                        out: qScratch, headDim: UInt32(headDim),
+                        numHeads: cfg.numHeads, eps: eps)
+                    rms.encodeBF16WPerHead(
+                        commandBuffer: cb1,
+                        x: kSlot.buffer, xOffset: kSlot.offset,
+                        weight: kNormW.buffer, weightOffset: Int(kNormW.offset),
+                        out: kSlot.buffer, outOffset: kSlot.offset,
+                        headDim: UInt32(headDim), numHeads: numKV, eps: eps)
+                }
                 rope.encodeNeoxSubdim(
                     commandBuffer: cb1, data: qScratch,
                     position: UInt32(position),

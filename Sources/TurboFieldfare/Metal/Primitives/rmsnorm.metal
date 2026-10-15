@@ -124,6 +124,37 @@ void rmsnorm_bf16w_perhead(
     }
 }
 
+// Qwen 3.8 (qwen4_exp) per-head Q/K norms: Qwen4ExpTextRMSNorm is zeros-init
+// with scale (1 + w), unlike the plain `* w` above. Shared [headDim] weight,
+// one threadgroup per head. Only the QSA (full-attention) path uses this;
+// GDN/Gemma/Qwen3.5-3.6 paths keep the plain kernel.
+[[kernel, max_total_threads_per_threadgroup(256)]]
+void rmsnorm_1pw_bf16w_perhead(
+    device const half*   x          [[buffer(0)]],   // [numHeads * headDim] FP16
+    device const bfloat* weight     [[buffer(1)]],   // [headDim] BF16, shared per head
+    device       half*   out        [[buffer(2)]],   // [numHeads * headDim] FP16
+    constant     uint&   headDim    [[buffer(3)]],
+    constant     float&  eps        [[buffer(4)]],
+    uint  head             [[threadgroup_position_in_grid]],
+    uint  lid              [[thread_position_in_threadgroup]],
+    uint  lsize            [[threads_per_threadgroup]],
+    uint  simd_lane_id     [[thread_index_in_simdgroup]],
+    uint  simd_group_id    [[simdgroup_index_in_threadgroup]],
+    uint  simdgroups       [[simdgroups_per_threadgroup]]
+) {
+    threadgroup float partial[kRmsMaxSimdGroups];
+    const uint HD = rms_fc_d(headDim);
+    device const half* xh = x   + head * HD;
+    device       half* oh = out + head * HD;
+    const float inv = rms_block_inv(xh, HD, eps, lid, lsize,
+                                    simd_lane_id, simd_group_id, simdgroups, partial);
+    for (uint i = lid; i < HD; i += lsize) {
+        float xv = float(xh[i]);
+        float wv = float(weight[i]);
+        oh[i] = half(xv * inv * (1.0f + wv));
+    }
+}
+
 [[kernel, max_total_threads_per_threadgroup(256)]]
 void rmsnorm_no_scale_perhead(
     device const half*  x          [[buffer(0)]],   // [numHeads * headDim] FP16

@@ -20,6 +20,8 @@ final class RMSNorm {
     private let psoNoScaleD2816: MTLComputePipelineState
     private let psoBF16PerHead256: MTLComputePipelineState
     private let psoBF16PerHead512: MTLComputePipelineState
+    private let psoOnePlusPerHead: MTLComputePipelineState
+    private let psoOnePlusPerHead256: MTLComputePipelineState
     private let psoNoScalePerHead256: MTLComputePipelineState
     private let psoNoScalePerHead512: MTLComputePipelineState
 
@@ -46,6 +48,10 @@ final class RMSNorm {
         self.psoNoScalePerHead512 = try Self.specializedPipeline(context,
                                                                  "rmsnorm_no_scale_perhead",
                                                                  d: 512)
+        self.psoOnePlusPerHead = try context.pipeline("rmsnorm_1pw_bf16w_perhead")
+        self.psoOnePlusPerHead256 = try Self.specializedPipeline(context,
+                                                                 "rmsnorm_1pw_bf16w_perhead",
+                                                                 d: 256)
     }
 
     /// Encode the BF16-weight variant (Gemma 4 norms).
@@ -97,6 +103,32 @@ final class RMSNorm {
                                   base: psoBF16PerHead,
                                   p256: psoBF16PerHead256,
                                   p512: psoBF16PerHead512)
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(x,      offset: xOffset,      index: 0)
+        enc.setBuffer(weight, offset: weightOffset, index: 1)
+        enc.setBuffer(out,    offset: outOffset,    index: 2)
+        var hd = headDim
+        var epsVar = eps
+        enc.setBytes(&hd,     length: MemoryLayout<UInt32>.size, index: 3)
+        enc.setBytes(&epsVar, length: MemoryLayout<Float>.size,  index: 4)
+        let w = min(Int(pso.maxTotalThreadsPerThreadgroup), 256)
+        enc.dispatchThreadgroups(MTLSize(width: numHeads, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: w, height: 1, depth: 1))
+        enc.endEncoding()
+    }
+
+    /// 1-centered per-head RMSNorm for Qwen 3.8 QSA Q/K norms
+    /// (`Qwen4ExpTextRMSNorm`, zeros-init): `y = x * inv * (1 + w)`.
+    /// Same dispatch contract as `encodeBF16WPerHead`; only the QSA path
+    /// uses this — Gemma/Qwen3.5-3.6 keep the plain kernel.
+    func encodeOnePlusBF16WPerHead(commandBuffer: MTLCommandBuffer,
+                                   x: MTLBuffer, xOffset: Int = 0,
+                                   weight: MTLBuffer, weightOffset: Int = 0,
+                                   out: MTLBuffer, outOffset: Int = 0,
+                                   headDim: UInt32, numHeads: Int,
+                                   eps: Float) {
+        guard let enc = commandBuffer.makeComputeCommandEncoder() else { return }
+        let pso = headDim == 256 ? psoOnePlusPerHead256 : psoOnePlusPerHead
         enc.setComputePipelineState(pso)
         enc.setBuffer(x,      offset: xOffset,      index: 0)
         enc.setBuffer(weight, offset: weightOffset, index: 1)
