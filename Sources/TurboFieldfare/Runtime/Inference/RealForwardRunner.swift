@@ -2854,6 +2854,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                                 count: hcHidden)
         }
         if Foundation.getenv("TURBO_FIELDFARE_DEBUG_QWEN38") != nil {
+            q38DebugProbe("pleEmbed", pleEmbed, cfg.pleEmbedDim)
+            q38DebugProbe("pleValue", pleValue, D)
             q38DebugProbe("pleGated", pleGated, hcHidden)
             q38DebugProbe("pleConvOut", pleConvOut, hcHidden)
         }
@@ -3211,6 +3213,21 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 q38DebugProbe("mlpIn.L\(L)", mlpIn, cfg.hiddenSize)
                 q38DebugProbe("h2.L\(L)", h2Buf, cfg.hiddenSize)
                 q38DebugProbe("inj.L\(L)", inj, hc)
+                q38DebugProbe("h1.L\(L)", h1Buf, cfg.hiddenSize)
+                if L == 0 {
+                    let wPtr = outWeights.contents().assumingMemoryBound(to: UInt16.self)
+                    var wSum: Float = 0
+                    for i in 0..<cfg.topKExperts { wSum += Self.q38F32(wPtr[i]) }
+                    let iPtr = outIndices.contents().assumingMemoryBound(to: UInt32.self)
+                    var iMax: UInt32 = 0
+                    var seen = Set<UInt32>()
+                    for i in 0..<cfg.topKExperts {
+                        iMax = max(iMax, iPtr[i])
+                        seen.insert(iPtr[i])
+                    }
+                    let msg = "[q38dbg] router wsum=\(wSum) imax=\(iMax) uniq=\(seen.count)\n"
+                    if let d = msg.data(using: .utf8) { FileHandle.standardError.write(d) }
+                }
             }
         }
         // Drain per-layer work (serial queue: waiting the last covers all).
