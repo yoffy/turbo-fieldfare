@@ -2950,7 +2950,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     /// `oOut`. At position 0 attention is trivial (weight 1.0 on the only
     /// key) and RoPE is the identity, so this validates V + gate + o_proj +
     /// norms with real weights; scores/softmax/RoPE need a later position.
-    private func q38DebugRefCheckQSA(attnIn: MTLBuffer, oOut: MTLBuffer, layer L: Int) {
+    private func q38DebugRefCheckQSA(attnIn: MTLBuffer, oOut: MTLBuffer,
+                                      compactV: MTLBuffer, layer L: Int) {
         do {
             let nQ = cfg.numHeads
             let nKV = cfg.numFullKVHeads
@@ -3013,6 +3014,29 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             }
             let rel = (md / Float(d)) / max(1e-6, sa / Float(d))
             q38DebugDump("refQSAoOut", "rel=\(rel) maxDiff=\(mx) \(rel < 0.08 ? "PASS" : "FAIL")")
+            // V-only isolation: post-gather compactV vs CPU V (catches K/V
+            // dequant, cache write/read, gather).
+            do {
+                let cp = compactV.contents().assumingMemoryBound(to: UInt16.self)
+                var mdv: Float = 0, mxv: Float = 0, sav: Float = 0
+                for i in 0..<kvDim {
+                    let dd = abs(vv[i] - Self.q38F32(cp[i]))
+                    mdv += dd; mxv = max(mxv, dd); sav += abs(vv[i])
+                }
+                let relv = (mdv / Float(kvDim)) / max(1e-6, sav / Float(kvDim))
+                q38DebugDump("refQSAv", "rel=\(relv) maxDiff=\(mxv) \(relv < 0.05 ? "PASS" : "FAIL")")
+            }
+            // Pre-o_proj isolation: attnOut (V repeated + gate) vs CPU.
+            do {
+                let ap = self.attnOut.contents().assumingMemoryBound(to: UInt16.self)
+                var mda: Float = 0, mxa: Float = 0, saa: Float = 0
+                for i in 0..<qDim {
+                    let dd = abs(attn[i] - Self.q38F32(ap[i]))
+                    mda += dd; mxa = max(mxa, dd); saa += abs(attn[i])
+                }
+                let rela = (mda / Float(qDim)) / max(1e-6, saa / Float(qDim))
+                q38DebugDump("refQSAattn", "rel=\(rela) maxDiff=\(mxa) \(rela < 0.05 ? "PASS" : "FAIL")")
+            }
             // Gate-only isolation: GPU post-split raw gate vs CPU strided
             // gate. The fused-QKV check covered query rows only; gate rows
             // (odd 256-blocks) were never verified.
@@ -3628,7 +3652,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 if dbgQ38 && position == 0 && L == 3 {
                     q38DebugProbe("qNormed.L3", qScratch, cfg.numHeads * headDim)
                     q38DebugRefCheckQPack(attnIn: attnIn, qPacked: qPackedScratch, layer: L)
-                    q38DebugRefCheckQSA(attnIn: attnIn, oOut: oOut, layer: L)
+                    q38DebugRefCheckQSA(attnIn: attnIn, oOut: oOut, compactV: compactV, layer: L)
                 }
                 // CPU: query finalize + block finalize into the pooled cache.
                 let completed = try q38IndexerPost(layer: L, position: position)
