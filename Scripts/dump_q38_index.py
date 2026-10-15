@@ -49,7 +49,7 @@ def main() -> None:
             if e is None:
                 print(f"\n{t}\n  NOT FOUND")
                 continue
-            _, _, dtype, fileOff, size, s0, s1, s2, s3, scOff, scSize, bOff, bSize = e
+            _, _, dtype, _, fileOff, size, s0, s1, s2, s3, scOff, scSize, bOff, bSize = e
             print(f"\n{t}")
             print(f"  dtype={dtype} shape=({s0},{s1},{s2},{s3})")
             print(f"  fileOff={fileOff} size={size} scOff={scOff} scSize={scSize} bOff={bOff} bSize={bSize}")
