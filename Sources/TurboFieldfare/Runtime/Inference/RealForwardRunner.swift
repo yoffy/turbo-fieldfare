@@ -2547,6 +2547,55 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     /// Temporary env-gated probe (TURBO_FIELDFARE_DEBUG_QWEN38=1): min/max/
     /// meanabs plus NaN/Inf flags of an FP16 shared buffer, to stderr.
     /// Zero overhead when the flag is unset.
+    private func q38DebugDump(_ label: String, _ msg: String) {
+        if let d = ("[q38dbg] " + label + " " + msg + "\n").data(using: .utf8) {
+            FileHandle.standardError.write(d)
+        }
+    }
+
+    /// Dump resident INT4 scales/biases (BF16) stats: count check plus
+    /// min/max/mean. Catches misaligned aux reads (zeros/garbage).
+    private func q38DebugDumpQuant(_ label: String, _ view: TensorView,
+                                  rows: Int, groupsPerRow: Int) {
+        let expect = rows * groupsPerRow
+        let haveS = Int(view.scaleLength) / 2
+        let haveB = Int(view.biasLength) / 2
+        let sPtr = view.buffer.contents().advanced(by: Int(view.scaleOffset))
+            .assumingMemoryBound(to: UInt16.self)
+        let bPtr = view.buffer.contents().advanced(by: Int(view.biasOffset))
+            .assumingMemoryBound(to: UInt16.self)
+        var sMin = Float.infinity, sMax = -Float.infinity, sAcc: Float = 0
+        var bMin = Float.infinity, bMax = -Float.infinity, bAcc: Float = 0
+        for i in 0..<min(expect, min(haveS, haveB)) {
+            let sv = Quantization.bf16ToFloat(sPtr[i])
+            let bv = Quantization.bf16ToFloat(bPtr[i])
+            sMin = min(sMin, sv); sMax = max(sMax, sv); sAcc += sv
+            bMin = min(bMin, bv); bMax = max(bMax, bv); bAcc += bv
+        }
+        let c = Float(max(1, min(expect, min(haveS, haveB))))
+        var first = ""
+        for i in 0..<min(4, min(expect, min(haveS, haveB))) {
+            first += "s\(Quantization.bf16ToFloat(sPtr[i]))/b\(Quantization.bf16ToFloat(bPtr[i])) "
+        }
+        q38DebugDump(label, "expScales=\(expect) haveS=\(haveS) haveB=\(haveB) "
+            + "sMin=\(sMin) sMax=\(sMax) sMean=\(sAcc/c) "
+            + "bMin=\(bMin) bMax=\(bMax) bMean=\(bAcc/c) first=[\(first)]")
+    }
+
+    /// Dump resident BF16 weight stats (norms should sit near 0 = scale ~1).
+    private func q38DebugDumpBF16(_ label: String, _ view: TensorView, count: Int) {
+        let have = Int(view.length) / 2
+        let ptr = view.buffer.contents().advanced(by: Int(view.offset))
+            .assumingMemoryBound(to: UInt16.self)
+        var mn = Float.infinity, mx = -Float.infinity, acc: Float = 0
+        for i in 0..<min(count, have) {
+            let v = Quantization.bf16ToFloat(ptr[i])
+            mn = min(mn, v); mx = max(mx, v); acc += v
+        }
+        let c = Float(max(1, min(count, have)))
+        q38DebugDump(label, "exp=\(count) have=\(have) min=\(mn) max=\(mx) mean=\(acc/c)")
+    }
+
     private func q38DebugProbe(_ label: String, _ buf: MTLBuffer, _ count: Int) {
         let ptr = buf.contents().assumingMemoryBound(to: UInt16.self)
         var mn = Float.infinity
@@ -2934,6 +2983,27 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
 
         let pleLayer = model.pleLayer()
         let sharedProjViews = sharedExpertProjections
+        if dbgQ38 && position == 0 {
+            do {
+                let inj0 = try model.attnHcBlockInject(layer: 0)
+                q38DebugDumpQuant("inj0", inj0, rows: hc,
+                                  groupsPerRow: hc * cfg.hiddenSize / 32)
+                let sg0 = try model.sharedExpertGate(layer: 0)
+                q38DebugDumpQuant("sharedGate0", sg0, rows: cfg.intermediateSize,
+                                  groupsPerRow: cfg.hiddenSize / 32)
+                if let ple = pleLayer {
+                    let pv = try model.pleValueProj(layer: ple)
+                    q38DebugDumpQuant("pleValue", pv, rows: cfg.hiddenSize,
+                                      groupsPerRow: cfg.pleEmbedDim / 32)
+                    let nc = try model.pleNormConv(layer: ple)
+                    q38DebugDumpBF16("pleNormConv", nc, count: hc * cfg.hiddenSize)
+                }
+                let hn = try model.attnHcNorm(layer: 0)
+                q38DebugDumpBF16("hcNorm0", hn, count: hc * cfg.hiddenSize)
+            } catch {
+                q38DebugDump("dumpError", "\(error)")
+            }
+        }
 
         for L in 0..<cfg.numLayers {
             if let ple = pleLayer, ple == L {
