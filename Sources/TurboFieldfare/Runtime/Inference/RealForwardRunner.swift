@@ -2544,6 +2544,29 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     @inline(__always)
     private static func q38F32(_ b: UInt16) -> Float { Float(Float16(bitPattern: b)) }
 
+    /// Temporary env-gated probe (TURBO_FIELDFARE_DEBUG_QWEN38=1): min/max/
+    /// meanabs plus NaN/Inf flags of an FP16 shared buffer, to stderr.
+    /// Zero overhead when the flag is unset.
+    private func q38DebugProbe(_ label: String, _ buf: MTLBuffer, _ count: Int) {
+        let ptr = buf.contents().assumingMemoryBound(to: UInt16.self)
+        var mn = Float.infinity
+        var mx = -Float.infinity
+        var acc: Float = 0
+        var nan = false
+        var inf = false
+        for i in 0..<count {
+            let v = Self.q38F32(ptr[i])
+            if v.isNaN { nan = true; continue }
+            if v.isInfinite { inf = true; continue }
+            mn = min(mn, v)
+            mx = max(mx, v)
+            acc += abs(v)
+        }
+        let mean = count > 0 ? acc / Float(count) : 0
+        let msg = "[q38dbg] \(label) n=\(count) min=\(mn) max=\(mx) meanabs=\(mean) nan=\(nan) inf=\(inf)\n"
+        if let d = msg.data(using: .utf8) { FileHandle.standardError.write(d) }
+    }
+
     /// One gated-residual mix (`Qwen4ExpTextGatedResidual`): grouped (1+w)
     /// norm, low-rank down/up mixer with silu/sigmoid, branch-mean. With
     /// `injectW != nil` also emits `2*sigmoid(block_inject/ hc)` injection
@@ -2883,6 +2906,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         let rotaryDim = UInt32(Double(cfg.fullHeadDim) * cfg.partialRotaryFactor)
         let topK = UInt32(cfg.topKExperts)
         var pendingQ38: [MTLCommandBuffer] = []
+        let dbgQ38 = Foundation.getenv("TURBO_FIELDFARE_DEBUG_QWEN38") != nil
 
         // Embed + 4-branch expand.
         let emb = model.embedding
@@ -2897,6 +2921,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                   groupSize: self.model.embeddingGroupSize)
             q38.encodeRepeat(commandBuffer: cb, x: self.hidden, y: hyper,
                              d: self.cfg.hiddenSize, h: hc)
+        }
+        if dbgQ38 && position == 0 {
+            q38DebugProbe("embed", self.hidden, self.cfg.hiddenSize)
         }
 
         let pleLayer = model.pleLayer()
@@ -3172,6 +3199,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             routedCB.commit()
             pendingQ38.append(sharedCB)
             pendingQ38.append(routedCB)
+            if dbgQ38 && position == 0 && (L == 0 || L == 3) {
+                waitForCompletion(routedCB)
+                q38DebugProbe("hyper.L\(L)", hyper, hc * cfg.hiddenSize)
+            }
         }
         // Drain per-layer work (serial queue: waiting the last covers all).
         if let last = pendingQ38.last { waitForCompletion(last) }
@@ -3192,6 +3223,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                   injOut: nil,
                                   groupSize: attnGroup)
         }
+        if dbgQ38 && position == 0 {
+            q38DebugProbe("mixer", self.normed, self.cfg.hiddenSize)
+        }
 
         if emitHead {
             let useFusedHeadForThisToken = useFusedGreedyHead && outputMode == .greedyIfAvailable
@@ -3211,6 +3245,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 }
                 totalHeadFusedNanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tHead
                 lastGreedyToken = greedyTokenBuf.contents().load(as: UInt32.self)
+                if dbgQ38 && position == 0 {
+                    let msg = "[q38dbg] token=\(lastGreedyToken)\n"
+                    if let d = msg.data(using: .utf8) { FileHandle.standardError.write(d) }
+                }
             } else {
                 let tHead = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
                 runSync { cb in
