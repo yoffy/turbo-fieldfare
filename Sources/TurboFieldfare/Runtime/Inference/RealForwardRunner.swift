@@ -3651,11 +3651,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 waitForCompletion(cb1)
                 if dbgQ38 && position == 0 && L == 3 {
                     q38DebugProbe("qNormed.L3", qScratch, cfg.numHeads * headDim)
-                    q38DebugProbe("compactV.L3", compactV, Int(kvDim))
-                    q38DebugProbe("attnOut.L3", self.attnOut, cfg.numHeads * headDim)
-                    q38DebugDump("selCount.L3", "\(selCount)")
                     q38DebugRefCheckQPack(attnIn: attnIn, qPacked: qPackedScratch, layer: L)
-                    q38DebugRefCheckQSA(attnIn: attnIn, oOut: oOut, compactV: compactV, layer: L)
                 }
                 // CPU: query finalize + block finalize into the pooled cache.
                 let completed = try q38IndexerPost(layer: L, position: position)
@@ -3721,6 +3717,12 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     weightBits: routerWeightBits)
                 cb2.commit()
                 waitForCompletion(cb2)
+                if dbgQ38 && position == 0 && L == 3 {
+                    q38DebugProbe("compactV.L3", compactV, Int(kvDim))
+                    q38DebugProbe("attnOut.L3", self.attnOut, cfg.numHeads * headDim)
+                    q38DebugDump("selCount.L3", "\(selCount)")
+                    q38DebugRefCheckQSA(attnIn: attnIn, oOut: oOut, compactV: compactV, layer: L)
+                }
             }
 
             // Router readback -> SSD fetch (overlaps the shared expert below).
