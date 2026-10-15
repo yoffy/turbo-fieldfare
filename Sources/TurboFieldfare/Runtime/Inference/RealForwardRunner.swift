@@ -2701,6 +2701,368 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             + "maxDiff=\(maxDiff) rel=\(rel) \(rel < 0.05 ? "PASS" : "FAIL")")
     }
 
+    /// Env-gated CPU-vs-GPU check for the L3 fused QKV projection with REAL
+    /// weights: dequantizes q_proj on CPU and compares against
+    /// `qPackedScratch` (raw packed [query;gate], pre-split). The fused QKV
+    /// kernel is a different code path from the proven `int4.encode` and
+    /// was never validated with production qwen38 dims (24Q/2KV, head 256).
+    private func q38DebugRefCheckQPack(attnIn: MTLBuffer, qPacked: MTLBuffer,
+                                      layer L: Int) {
+        do {
+            let q = try model.qProj(layer: L)
+            let rows = 2 * cfg.numHeads * cfg.fullHeadDim
+            let cols = cfg.hiddenSize
+            let g = model.attentionGroupSize
+            guard cols % g == 0 else {
+                q38DebugDump("refQPack", "cols not multiple of group")
+                return
+            }
+            let groups = cols / g
+            let xPtr = attnIn.contents().assumingMemoryBound(to: UInt16.self)
+            var x = [Float](repeating: 0, count: cols)
+            for i in 0..<cols { x[i] = Self.q38F32(xPtr[i]) }
+            let wBase = q.buffer.contents().advanced(by: Int(q.offset))
+            let sBase = q.buffer.contents().advanced(by: Int(q.scaleOffset))
+            let bBase = q.buffer.contents().advanced(by: Int(q.biasOffset))
+            let rowBytes = cols / 2
+            var maxDiff: Float = 0
+            var sumDiff: Float = 0
+            var sumAbs: Float = 0
+            let checkRows = min(rows, 256)
+            let yPtr = qPacked.contents().assumingMemoryBound(to: UInt16.self)
+            for r in 0..<checkRows {
+                let wRow = wBase.advanced(by: r * rowBytes).assumingMemoryBound(to: UInt8.self)
+                let sRow = sBase.advanced(by: r * groups * 2).assumingMemoryBound(to: UInt16.self)
+                let bRow = bBase.advanced(by: r * groups * 2).assumingMemoryBound(to: UInt16.self)
+                var packed = [UInt8](repeating: 0, count: rowBytes)
+                var sc = [UInt16](repeating: 0, count: groups)
+                var bi = [UInt16](repeating: 0, count: groups)
+                for i in 0..<rowBytes { packed[i] = wRow[i] }
+                for i in 0..<groups { sc[i] = sRow[i]; bi[i] = bRow[i] }
+                let w = Quantization.dequantizeInt4Affine(
+                    Quantization.Int4AffineRow(packed: packed, scales: sc, biases: bi),
+                    n: cols, groupSize: g)
+                var acc: Float = 0
+                for i in 0..<cols { acc += w[i] * x[i] }
+                let yGPU = Self.q38F32(yPtr[r])
+                let d = abs(acc - yGPU)
+                maxDiff = max(maxDiff, d)
+                sumDiff += d
+                sumAbs += abs(acc)
+            }
+            let meanDiff = sumDiff / Float(max(1, checkRows))
+            let meanAbs = sumAbs / Float(max(1, checkRows))
+            let rel = meanDiff / max(1e-6, meanAbs)
+            q38DebugDump("refQPack", "rows=\(checkRows)/\(rows) cols=\(cols) meanDiff=\(meanDiff) "
+                + "maxDiff=\(maxDiff) rel=\(rel) \(rel < 0.05 ? "PASS" : "FAIL")")
+        } catch {
+            q38DebugDump("refQPack", "error \(error)")
+        }
+    }
+
+    /// Shared CPU INT4-g32 GEMV helper for reference checks: dequantizes
+    /// `rows` of `view` ([rows, cols], group 32) and dots each with `x`.
+    private func q38DebugGEMV4(view: TensorView, rows: Int, cols: Int,
+                              x: [Float]) -> [Float] {
+        let g = 32
+        let groups = cols / g
+        let rowBytes = cols / 2
+        let wBase = view.buffer.contents().advanced(by: Int(view.offset))
+        let sBase = view.buffer.contents().advanced(by: Int(view.scaleOffset))
+        let bBase = view.buffer.contents().advanced(by: Int(view.biasOffset))
+        var y = [Float](repeating: 0, count: rows)
+        for r in 0..<rows {
+            let wRow = wBase.advanced(by: r * rowBytes).assumingMemoryBound(to: UInt8.self)
+            let sRow = sBase.advanced(by: r * groups * 2).assumingMemoryBound(to: UInt16.self)
+            let bRow = bBase.advanced(by: r * groups * 2).assumingMemoryBound(to: UInt16.self)
+            var packed = [UInt8](repeating: 0, count: rowBytes)
+            var sc = [UInt16](repeating: 0, count: groups)
+            var bi = [UInt16](repeating: 0, count: groups)
+            for i in 0..<rowBytes { packed[i] = wRow[i] }
+            for i in 0..<groups { sc[i] = sRow[i]; bi[i] = bRow[i] }
+            let w = Quantization.dequantizeInt4Affine(
+                Quantization.Int4AffineRow(packed: packed, scales: sc, biases: bi),
+                n: cols, groupSize: g)
+            var acc: Float = 0
+            for i in 0..<cols { acc += w[i] * x[i] }
+            y[r] = acc
+        }
+        return y
+    }
+
+    /// L0 router check: CPU INT8-g64 logits + reference top-k vs the GPU
+    /// `outIndices`/`outWeights`. Wrong expert selection destroys content
+    /// while preserving magnitudes (softmax renormalizes anything).
+    private func q38DebugRefCheckRouter(mlpIn: MTLBuffer, layer L: Int) {
+        do {
+            let routerW = try model.router(layer: L)
+            let nExp = cfg.numExperts
+            let d = cfg.hiddenSize
+            let groups = d / 64
+            let xPtr = mlpIn.contents().assumingMemoryBound(to: UInt16.self)
+            var x = [Float](repeating: 0, count: d)
+            for i in 0..<d { x[i] = Self.q38F32(xPtr[i]) }
+            let wBase = routerW.buffer.contents().advanced(by: Int(routerW.offset))
+            let sBase = routerW.buffer.contents().advanced(by: Int(routerW.scaleOffset))
+            let bBase = routerW.buffer.contents().advanced(by: Int(routerW.biasOffset))
+            var logits = [Float](repeating: 0, count: nExp)
+            for r in 0..<nExp {
+                let wRow = wBase.advanced(by: r * d).assumingMemoryBound(to: UInt8.self)
+                let sRow = sBase.advanced(by: r * groups * 2).assumingMemoryBound(to: UInt16.self)
+                let bRow = bBase.advanced(by: r * groups * 2).assumingMemoryBound(to: UInt16.self)
+                var packed = [UInt8](repeating: 0, count: d)
+                var sc = [UInt16](repeating: 0, count: groups)
+                var bi = [UInt16](repeating: 0, count: groups)
+                for i in 0..<d { packed[i] = wRow[i] }
+                for i in 0..<groups { sc[i] = sRow[i]; bi[i] = bRow[i] }
+                let w = Quantization.dequantizeInt8Affine(
+                    Quantization.Int8AffineRow(packed: packed, scales: sc, biases: bi),
+                    n: d, groupSize: 64)
+                var acc: Float = 0
+                for i in 0..<d { acc += w[i] * x[i] }
+                logits[r] = acc
+            }
+            let ref = Qwen38Reference.routerTopK(logits: logits, topK: cfg.topKExperts)
+            let iPtr = outIndices.contents().assumingMemoryBound(to: UInt32.self)
+            let wPtr = outWeights.contents().assumingMemoryBound(to: UInt16.self)
+            var idxOK = true
+            var maxWDiff: Float = 0
+            for i in 0..<cfg.topKExperts {
+                if Int(iPtr[i]) != ref.indices[i] { idxOK = false }
+                maxWDiff = max(maxWDiff, abs(Self.q38F32(wPtr[i]) - ref.weights[i]))
+            }
+            q38DebugDump("refRouter", "idxMatch=\(idxOK) maxWDiff=\(maxWDiff) "
+                + "gpu0=\(iPtr[0]) ref0=\(ref.indices[0]) "
+                + "\((idxOK && maxWDiff < 0.02) ? "PASS" : "FAIL")")
+        } catch {
+            q38DebugDump("refRouter", "error \(error)")
+        }
+    }
+
+    /// L0 GDN check: CPU single-step (fresh state, position 0) reference vs
+    /// GPU `gdnConvOut` (isolates in-proj + conv) and `oOut` (full delta
+    /// rule + gated norm + out_proj). The delta rule for one fresh token is
+    /// `out = beta * (q.k) * v` after L2 norms; straight from the reference.
+    private func q38DebugRefCheckGDN(attnIn: MTLBuffer, oOut: MTLBuffer, layer L: Int) {
+        do {
+            let nK = cfg.linearAttention.numKHeads
+            let nV = cfg.linearAttention.numVHeads
+            let hK = cfg.linearAttention.keyHeadDim
+            let hV = cfg.linearAttention.valueHeadDim
+            let keyDim = nK * hK
+            let valDim = nV * hV
+            let qkvDim = keyDim * 2 + valDim
+            let d = cfg.hiddenSize
+            let xPtr = attnIn.contents().assumingMemoryBound(to: UInt16.self)
+            var x = [Float](repeating: 0, count: d)
+            for i in 0..<d { x[i] = Self.q38F32(xPtr[i]) }
+            let qkv = q38DebugGEMV4(view: try model.linearInProjQKV(layer: L),
+                                    rows: qkvDim, cols: d, x: x)
+            let z = q38DebugGEMV4(view: try model.linearInProjZ(layer: L),
+                                  rows: valDim, cols: d, x: x)
+            let a = q38DebugGEMV4(view: try model.linearInProjA(layer: L),
+                                  rows: nV, cols: d, x: x)
+            let b = q38DebugGEMV4(view: try model.linearInProjB(layer: L),
+                                  rows: nV, cols: d, x: x)
+            // Causal depthwise conv at position 0: past taps are zero, only
+            // the newest tap (last column) sees the current input.
+            let convW = try model.linearConv1d(layer: L)
+            let cwPtr = convW.buffer.contents().advanced(by: Int(convW.offset))
+                .assumingMemoryBound(to: UInt16.self)
+            let kernel = cfg.linearAttention.convKernelSize
+            var conv = [Float](repeating: 0, count: qkvDim)
+            for c in 0..<qkvDim {
+                let wLast = Quantization.bf16ToFloat(cwPtr[c * kernel + (kernel - 1)])
+                let v: Float = wLast * qkv[c]
+                conv[c] = v / (1.0 + exp(-v)) // silu
+            }
+            if let gco = gdnConvOut {
+                let p = gco.contents().assumingMemoryBound(to: UInt16.self)
+                var md: Float = 0, mx: Float = 0, sa: Float = 0
+                for i in 0..<qkvDim {
+                    let dd = abs(conv[i] - Self.q38F32(p[i]))
+                    md += dd; mx = max(mx, dd); sa += abs(conv[i])
+                }
+                let rel = (md / Float(qkvDim)) / max(1e-6, sa / Float(qkvDim))
+                q38DebugDump("refGDNconv", "rel=\(rel) \(rel < 0.05 ? "PASS" : "FAIL")")
+            }
+            var q = Array(conv[0..<keyDim])
+            var k = Array(conv[keyDim..<(2 * keyDim)])
+            let v = Array(conv[(2 * keyDim)..<qkvDim])
+            func l2(_ r: [Float]) -> [Float] {
+                var s: Float = 0
+                for e in r { s += e * e }
+                let inv = 1.0 / sqrt(s + 1e-6)
+                return r.map { $0 * inv }
+            }
+            let qScale = 1.0 / sqrt(Float(hK))
+            var qH: [[Float]] = [], kH: [[Float]] = []
+            for h in 0..<nK {
+                let qr = l2(Array(q[(h * hK)..<((h + 1) * hK)]))
+                qH.append(qr.map { $0 * qScale })
+                kH.append(l2(Array(k[(h * hK)..<((h + 1) * hK)])))
+            }
+            var vH: [[Float]] = [], zH: [[Float]] = []
+            for h in 0..<nV {
+                vH.append(Array(v[(h * hV)..<((h + 1) * hV)]))
+                zH.append(Array(z[(h * hV)..<((h + 1) * hV)]))
+            }
+            let aLogV = try model.linearALog(layer: L)
+            let dtV = try model.linearDtBias(layer: L)
+            let aPtr = aLogV.buffer.contents().advanced(by: Int(aLogV.offset))
+                .assumingMemoryBound(to: UInt16.self)
+            let dPtr = dtV.buffer.contents().advanced(by: Int(dtV.offset))
+                .assumingMemoryBound(to: UInt16.self)
+            let rep = nV / nK
+            var core = [Float](repeating: 0, count: valDim)
+            for h in 0..<nV {
+                let beta: Float = 1.0 / (1.0 + exp(-b[h]))
+                var dot: Float = 0
+                for j in 0..<hK { dot += qH[h / rep][j] * kH[h / rep][j] }
+                for j in 0..<hV { core[h * hV + j] = beta * dot * vH[h][j] }
+            }
+            let gnW = try model.linearNorm(layer: L)
+            let gnPtr = gnW.buffer.contents().advanced(by: Int(gnW.offset))
+                .assumingMemoryBound(to: UInt16.self)
+            var gnWf = [Float](repeating: 0, count: hV)
+            for j in 0..<hV { gnWf[j] = Quantization.bf16ToFloat(gnPtr[j]) }
+            var gated = [Float](repeating: 0, count: valDim)
+            for h in 0..<nV {
+                var ms: Float = 0
+                for j in 0..<hV { ms += core[h * hV + j] * core[h * hV + j] }
+                let inv = 1.0 / sqrt(ms / Float(hV) + 1e-6)
+                for j in 0..<hV {
+                    let sz: Float = zH[h][j] / (1.0 + exp(-zH[h][j]))
+                    gated[h * hV + j] = core[h * hV + j] * inv * gnWf[j] * sz
+                }
+            }
+            let o = q38DebugGEMV4(view: try model.linearOutProj(layer: L),
+                                 rows: d, cols: valDim, x: gated)
+            let oPtr = oOut.contents().assumingMemoryBound(to: UInt16.self)
+            var md: Float = 0, mx: Float = 0, sa: Float = 0
+            for i in 0..<d {
+                let dd = abs(o[i] - Self.q38F32(oPtr[i]))
+                md += dd; mx = max(mx, dd); sa += abs(o[i])
+            }
+            let rel = (md / Float(d)) / max(1e-6, sa / Float(d))
+            q38DebugDump("refGDNoOut", "rel=\(rel) maxDiff=\(mx) \(rel < 0.08 ? "PASS" : "FAIL")")
+        } catch {
+            q38DebugDump("refGDN", "error \(error)")
+        }
+    }
+
+    /// L3 QSA check (position 0, single KV): CPU V/gate/o_proj path vs GPU
+    /// `oOut`. At position 0 attention is trivial (weight 1.0 on the only
+    /// key) and RoPE is the identity, so this validates V + gate + o_proj +
+    /// norms with real weights; scores/softmax/RoPE need a later position.
+    private func q38DebugRefCheckQSA(attnIn: MTLBuffer, oOut: MTLBuffer, layer L: Int) {
+        do {
+            let nQ = cfg.numHeads
+            let nKV = cfg.numFullKVHeads
+            let hd = cfg.fullHeadDim
+            let qDim = nQ * hd
+            let kvDim = nKV * hd
+            let d = cfg.hiddenSize
+            let eps: Float = 1e-6
+            let xPtr = attnIn.contents().assumingMemoryBound(to: UInt16.self)
+            var x = [Float](repeating: 0, count: d)
+            for i in 0..<d { x[i] = Self.q38F32(xPtr[i]) }
+            let qq = q38DebugGEMV4(view: try model.qProj(layer: L),
+                                   rows: 2 * qDim, cols: d, x: x)
+            let query = Array(qq[0..<qDim])
+            let gate = Array(qq[qDim..<(2 * qDim)])
+            let kk = q38DebugGEMV4(view: try model.kProj(layer: L),
+                                   rows: kvDim, cols: d, x: x)
+            let vv = q38DebugGEMV4(view: try model.vProj(layer: L),
+                                   rows: kvDim, cols: d, x: x)
+            let qNW = try model.qNorm(layer: L)
+            let kNW = try model.kNorm(layer: L)
+            let qwPtr = qNW.buffer.contents().advanced(by: Int(qNW.offset))
+                .assumingMemoryBound(to: UInt16.self)
+            let kwPtr = kNW.buffer.contents().advanced(by: Int(kNW.offset))
+                .assumingMemoryBound(to: UInt16.self)
+            var qw = [Float](repeating: 0, count: hd)
+            var kw = [Float](repeating: 0, count: hd)
+            for i in 0..<hd {
+                qw[i] = Quantization.bf16ToFloat(qwPtr[i])
+                kw[i] = Quantization.bf16ToFloat(kwPtr[i])
+            }
+            let rep = nQ / nKV
+            var attn = [Float](repeating: 0, count: qDim)
+            for h in 0..<nQ {
+                let qr = Qwen38Reference.rmsNorm(Array(query[(h * hd)..<((h + 1) * hd)]),
+                                                weight: qw, eps: eps)
+                _ = qr // normed Q unused at pos 0 (single-key attention)
+                let vh = Array(vv[((h / rep) * hd)..<(((h / rep) + 1) * hd)])
+                let gr = Array(gate[(h * hd)..<((h + 1) * hd)])
+                for j in 0..<hd {
+                    attn[h * hd + j] = vh[j] / (1.0 + exp(-gr[j]))
+                }
+            }
+            let o = q38DebugGEMV4(view: try model.oProj(layer: L),
+                                 rows: d, cols: qDim, x: attn)
+            let oPtr = oOut.contents().assumingMemoryBound(to: UInt16.self)
+            var md: Float = 0, mx: Float = 0, sa: Float = 0
+            for i in 0..<d {
+                let dd = abs(o[i] - Self.q38F32(oPtr[i]))
+                md += dd; mx = max(mx, dd); sa += abs(o[i])
+            }
+            let rel = (md / Float(d)) / max(1e-6, sa / Float(d))
+            q38DebugDump("refQSAoOut", "rel=\(rel) maxDiff=\(mx) \(rel < 0.08 ? "PASS" : "FAIL")")
+        } catch {
+            q38DebugDump("refQSA", "error \(error)")
+        }
+    }
+
+    /// Head consistency check (position 0): non-fused full-logits argmax vs
+    /// fused greedy-head id, both from the same `normed` hidden state. Same
+    /// weights + same input must agree; disagreement isolates the fused
+    /// head (the production greedy path) without a 250k-row CPU GEMV.
+    private func q38DebugRefCheckHead() {
+        let lm = model.lmHead
+        let d = cfg.hiddenSize
+        let vocab = cfg.vocabSize
+        let eps: Float = 1e-6
+        let attnGroup = model.attentionGroupSize
+        guard let logitsBuf = ctx.device.makeBuffer(length: vocab * 2,
+                                                    options: .storageModeShared),
+              let tokBuf = ctx.device.makeBuffer(length: 4,
+                                                 options: .storageModeShared) else {
+            q38DebugDump("refHead", "alloc failed")
+            return
+        }
+        runSync { cb in
+            self.int4.encode(commandBuffer: cb,
+                             weights: lm.buffer, weightsOffset: Int(lm.offset),
+                             scales: lm.buffer, scalesOffset: Int(lm.scaleOffset),
+                             biases: lm.buffer, biasesOffset: Int(lm.biasOffset),
+                             x: self.normed, y: logitsBuf,
+                             m: UInt32(vocab), n: UInt32(d),
+                             groupSize: attnGroup)
+        }
+        let lPtr = logitsBuf.contents().assumingMemoryBound(to: UInt16.self)
+        var best = 0
+        var bestV = -Float.infinity
+        for i in 0..<vocab {
+            let v = Self.q38F32(lPtr[i])
+            if v > bestV { bestV = v; best = i }
+        }
+        runSync { cb in
+            self.fusionHead.encodeGreedyDecode(
+                commandBuffer: cb, hidden: self.normed,
+                normWeight: self.normed, normOffset: 0,
+                weights: lm.buffer, weightsOffset: Int(lm.offset),
+                scales: lm.buffer, scalesOffset: Int(lm.scaleOffset),
+                biases: lm.buffer, biasesOffset: Int(lm.biasOffset),
+                outToken: tokBuf,
+                d: UInt32(d), vocab: UInt32(vocab),
+                rmsEps: eps, groupSize: attnGroup, skipNorm: true)
+        }
+        let fused = Int(tokBuf.contents().load(as: UInt32.self))
+        q38DebugDump("refHead", "nonfused=\(best) fused=\(fused) "
+            + "\(best == fused ? "PASS" : "FAIL")")
+    }
+
     private func q38DebugProbe(_ label: String, _ buf: MTLBuffer, _ count: Int) {        let ptr = buf.contents().assumingMemoryBound(to: UInt16.self)
         var mn = Float.infinity
         var mx = -Float.infinity
@@ -3248,6 +3610,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 waitForCompletion(cb1)
                 if dbgQ38 && position == 0 && L == 3 {
                     q38DebugProbe("qNormed.L3", qScratch, cfg.numHeads * headDim)
+                    if let qps = qPackedScratch {
+                        q38DebugRefCheckQPack(attnIn: attnIn, qPacked: qps, layer: L)
+                    }
+                    q38DebugRefCheckQSA(attnIn: attnIn, oOut: oOut, layer: L)
                 }
                 // CPU: query finalize + block finalize into the pooled cache.
                 let completed = try q38IndexerPost(layer: L, position: position)
@@ -3413,6 +3779,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 q38DebugProbe("h1.L\(L)", h1Buf, cfg.hiddenSize)
                 if L == 0 {
                     q38DebugRefCheckGate(mlpIn: mlpIn, layer: L)
+                    q38DebugRefCheckRouter(mlpIn: mlpIn, layer: L)
+                    q38DebugRefCheckGDN(attnIn: attnIn, oOut: oOut, layer: L)
                     let wPtr = outWeights.contents().assumingMemoryBound(to: UInt16.self)
                     var wSum: Float = 0
                     for i in 0..<cfg.topKExperts { wSum += Self.q38F32(wPtr[i]) }
@@ -3449,6 +3817,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         }
         if dbgQ38 && position == 0 {
             q38DebugProbe("mixer", self.normed, self.cfg.hiddenSize)
+            q38DebugRefCheckHead()
         }
 
         if emitHead {
