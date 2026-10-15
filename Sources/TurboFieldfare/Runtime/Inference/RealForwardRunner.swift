@@ -3104,6 +3104,59 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             + "\(best == fused ? "PASS" : "FAIL")")
     }
 
+    /// RoPE unit check (no model data): synthetic ramp vector through
+    /// `encodeNeoxSubdim` at position 5 vs the CPU reference. Position 0 is
+    /// the identity and verifies nothing; every prefill token after the
+    /// first depends on nonzero-position RoPE. Rotation preserves
+    /// magnitudes, so a RoPE bug destroys content while keeping all
+    /// magnitude probes green -- exactly the observed pattern.
+    private func q38DebugRefCheckRope() {
+        guard let ropeK = rope else {
+            q38DebugDump("refRope", "no rope kernel")
+            return
+        }
+        let hd = cfg.fullHeadDim
+        let nH = 4
+        let rotaryDim = Int(Double(hd) * cfg.partialRotaryFactor)
+        let count = nH * hd
+        guard let buf = ctx.device.makeBuffer(length: count * 2,
+                                             options: .storageModeShared) else {
+            q38DebugDump("refRope", "alloc failed")
+            return
+        }
+        let ptr = buf.contents().assumingMemoryBound(to: UInt16.self)
+        var cpu = [Float](repeating: 0, count: count)
+        for h in 0..<nH {
+            for i in 0..<hd {
+                let v = Float(h * hd + i) / Float(count)
+                cpu[h * hd + i] = v
+                ptr[h * hd + i] = Self.q38F16(v)
+            }
+        }
+        runSync { cb in
+            ropeK.encodeNeoxSubdim(commandBuffer: cb, data: buf,
+                                   position: 5,
+                                   headDim: UInt32(hd),
+                                   numHeads: UInt32(nH),
+                                   rotaryDim: UInt32(rotaryDim),
+                                   theta: Float(cfg.fullRopeTheta))
+        }
+        let oPtr = buf.contents().assumingMemoryBound(to: UInt16.self)
+        var md: Float = 0, mx: Float = 0, sa: Float = 0
+        for h in 0..<nH {
+            let row = Array(cpu[(h * hd)..<((h + 1) * hd)])
+            let ref = Qwen38Reference.applyRopeNeoxCPU(
+                row, position: 5, headDim: hd, rotaryDim: rotaryDim,
+                theta: cfg.ropeTheta)
+            for i in 0..<hd {
+                let dd = abs(ref[i] - Self.q38F32(oPtr[h * hd + i]))
+                md += dd; mx = max(mx, dd); sa += abs(ref[i])
+            }
+        }
+        let rel = (md / Float(count)) / max(1e-6, sa / Float(count))
+        q38DebugDump("refRope", "rel=\(rel) maxDiff=\(mx) \(rel < 0.02 ? "PASS" : "FAIL")")
+    }
+
     private func q38DebugProbe(_ label: String, _ buf: MTLBuffer, _ count: Int) {        let ptr = buf.contents().assumingMemoryBound(to: UInt16.self)
         var mn = Float.infinity
         var mx = -Float.infinity
@@ -3862,6 +3915,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         if dbgQ38 && position == 0 {
             q38DebugProbe("mixer", self.normed, self.cfg.hiddenSize)
             q38DebugRefCheckHead()
+            q38DebugRefCheckRope()
         }
 
         if emitHead {
