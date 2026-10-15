@@ -2964,8 +2964,17 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             for i in 0..<d { x[i] = Self.q38F32(xPtr[i]) }
             let qq = q38DebugGEMV4(view: try model.qProj(layer: L),
                                    rows: 2 * qDim, cols: d, x: x)
-            let query = Array(qq[0..<qDim])
-            let gate = Array(qq[qDim..<(2 * qDim)])
+            // Packed q_proj is per-head interleaved [q0,g0,q1,g1,...] (viewed
+            // as [heads, 2*headDim] then chunked on the last dim), NOT two
+            // contiguous halves.
+            var query = [Float](repeating: 0, count: qDim)
+            var gate = [Float](repeating: 0, count: qDim)
+            for h in 0..<nQ {
+                for j in 0..<hd {
+                    query[h * hd + j] = qq[h * 2 * hd + j]
+                    gate[h * hd + j] = qq[h * 2 * hd + hd + j]
+                }
+            }
             // Note: K is unused at position 0 (single-key attention has
             // weight 1.0 by construction); Q·K scores need a later position.
             let vv = q38DebugGEMV4(view: try model.vProj(layer: L),
