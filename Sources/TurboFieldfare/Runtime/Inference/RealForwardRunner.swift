@@ -2839,11 +2839,17 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         }
     }
 
+    /// CPU mirror of the GDN conv tail + recurrent state per layer, for the
+    /// position-1 carry check. Saved during the position-0 step, consumed
+    /// (and re-saved) at position 1. Debug-only.
+    private var q38DebugGDNMirror: [Int: (tail: [[Float]], s: [[[Float]]])] = [:]
+
     /// L0 GDN check: CPU single-step (fresh state, position 0) reference vs
     /// GPU `gdnConvOut` (isolates in-proj + conv) and `oOut` (full delta
     /// rule + gated norm + out_proj). The delta rule for one fresh token is
     /// `out = beta * (q.k) * v` after L2 norms; straight from the reference.
-    private func q38DebugRefCheckGDN(attnIn: MTLBuffer, oOut: MTLBuffer, layer L: Int) {
+    private func q38DebugRefCheckGDN(attnIn: MTLBuffer, oOut: MTLBuffer,
+                                       layer L: Int, position p: Int) {
         do {
             let nK = cfg.linearAttention.numKHeads
             let nV = cfg.linearAttention.numVHeads
@@ -2852,6 +2858,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             let keyDim = nK * hK
             let valDim = nV * hV
             let qkvDim = keyDim * 2 + valDim
+            let kernel = cfg.linearAttention.convKernelSize
             let d = cfg.hiddenSize
             let xPtr = attnIn.contents().assumingMemoryBound(to: UInt16.self)
             var x = [Float](repeating: 0, count: d)
@@ -2862,26 +2869,44 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                   rows: valDim, cols: d, x: x)
             let b = q38DebugGEMV4(view: try model.linearInProjB(layer: L),
                                   rows: nV, cols: d, x: x)
-            // Note: in_proj_a / A_log / dt_bias only feed the decay `g`, which
-            // multiplies the (zero) fresh state at position 0, so they drop
-            // out of this single-step check by construction.
-            // Causal depthwise conv at position 0: past taps are zero, only
-            // the newest tap (last column) sees the current input.
+            // Conv window: zero past at position 0, mirror tail otherwise.
+            var window: [[Float]] = []
+            if p == 0 {
+                let zq = [Float](repeating: 0, count: qkvDim)
+                window = [zq, zq, zq].suffix(kernel - 1).map { $0 }
+                if window.count < kernel - 1 {
+                    window = [[Float]](repeating: zq, count: kernel - 1)
+                }
+            } else {
+                guard let m = q38DebugGDNMirror[L] else {
+                    q38DebugDump("refGDNpos1", "no mirror; run position 0 first")
+                    return
+                }
+                window = m.tail
+            }
+            window.append(qkv)
+            while window.count > kernel { window.removeFirst() }
+            while window.count < kernel {
+                window.insert([Float](repeating: 0, count: qkvDim), at: 0)
+            }
             let convW = try model.linearConv1d(layer: L)
             let cwPtr = convW.buffer.contents().advanced(by: Int(convW.offset))
                 .assumingMemoryBound(to: UInt16.self)
-            let kernel = cfg.linearAttention.convKernelSize
             var conv = [Float](repeating: 0, count: qkvDim)
             for c in 0..<qkvDim {
-                let wLast = Quantization.bf16ToFloat(cwPtr[c * kernel + (kernel - 1)])
-                let v: Float = wLast * qkv[c]
-                conv[c] = v / (1.0 + exp(-v)) // silu
+                var acc: Float = 0
+                for t in 0..<kernel {
+                    acc += Quantization.bf16ToFloat(cwPtr[c * kernel + t]) * window[t][c]
+                }
+                conv[c] = acc / (1.0 + exp(-acc)) // silu
             }
-            if let gco = gdnConvOut {
-                let p = gco.contents().assumingMemoryBound(to: UInt16.self)
+            // Save tail for the next position (last kernel-1 windows).
+            let newTail = Array(window.suffix(kernel - 1))
+            if p == 0, let gco = gdnConvOut {
+                let gp = gco.contents().assumingMemoryBound(to: UInt16.self)
                 var md: Float = 0, mx: Float = 0, sa: Float = 0
                 for i in 0..<qkvDim {
-                    let dd = abs(conv[i] - Self.q38F32(p[i]))
+                    let dd = abs(conv[i] - Self.q38F32(gp[i]))
                     md += dd; mx = max(mx, dd); sa += abs(conv[i])
                 }
                 let rel = (md / Float(qkvDim)) / max(1e-6, sa / Float(qkvDim))
@@ -2909,13 +2934,69 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 zH.append(Array(z[(h * hV)..<((h + 1) * hV)]))
             }
             let rep = nV / nK
+            // Recurrent step: fresh (S=0) at position 0, mirror state after.
+            var sState: [[[Float]]]
+            var beta = [Float](repeating: 0, count: nV)
+            for h in 0..<nV { beta[h] = 1.0 / (1.0 + exp(-b[h])) }
+            if p == 0 {
+                sState = [[[Float]]](
+                    repeating: [[Float]](
+                        repeating: [Float](repeating: 0, count: hV), count: hK),
+                    count: nV)
+            } else {
+                guard let m = q38DebugGDNMirror[L] else {
+                    q38DebugDump("refGDNpos1", "no mirror; run position 0 first")
+                    return
+                }
+                sState = m.s
+                let a = q38DebugGEMV4(view: try model.linearInProjA(layer: L),
+                                      rows: nV, cols: d, x: x)
+                let aLogV = try model.linearALog(layer: L)
+                let dtV = try model.linearDtBias(layer: L)
+                let ap = aLogV.buffer.contents().advanced(by: Int(aLogV.offset))
+                    .assumingMemoryBound(to: UInt16.self)
+                let dp = dtV.buffer.contents().advanced(by: Int(dtV.offset))
+                    .assumingMemoryBound(to: UInt16.self)
+                for h in 0..<nV {
+                    let av = a[h] + Quantization.bf16ToFloat(dp[h])
+                    let g = -exp(Quantization.bf16ToFloat(ap[h]))
+                        * log(1.0 + exp(av))
+                    let dec = exp(g)
+                    for i in 0..<hK {
+                        for j in 0..<hV { sState[h][i][j] *= dec }
+                    }
+                }
+            }
             var core = [Float](repeating: 0, count: valDim)
             for h in 0..<nV {
-                let beta: Float = 1.0 / (1.0 + exp(-b[h]))
-                var dot: Float = 0
-                for j in 0..<hK { dot += qH[h / rep][j] * kH[h / rep][j] }
-                for j in 0..<hV { core[h * hV + j] = beta * dot * vH[h][j] }
+                let qh = qH[h / rep], kh = kH[h / rep]
+                if p == 0 {
+                    var dot: Float = 0
+                    for j in 0..<hK { dot += qh[j] * kh[j] }
+                    for j in 0..<hV { core[h * hV + j] = beta[h] * dot * vH[h][j] }
+                    for i in 0..<hK {
+                        for j in 0..<hV {
+                            sState[h][i][j] = kh[i] * (beta[h] * vH[h][j])
+                        }
+                    }
+                } else {
+                    var kvMem = [Float](repeating: 0, count: hV)
+                    for i in 0..<hK {
+                        for j in 0..<hV { kvMem[j] += sState[h][i][j] * kh[i] }
+                    }
+                    var delta = [Float](repeating: 0, count: hV)
+                    for j in 0..<hV { delta[j] = (vH[h][j] - kvMem[j]) * beta[h] }
+                    for i in 0..<hK {
+                        for j in 0..<hV { sState[h][i][j] += kh[i] * delta[j] }
+                    }
+                    for j in 0..<hV {
+                        var o: Float = 0
+                        for i in 0..<hK { o += sState[h][i][j] * qh[i] }
+                        core[h * hV + j] = o
+                    }
+                }
             }
+            q38DebugGDNMirror[L] = (tail: newTail, s: sState)
             let gnW = try model.linearNorm(layer: L)
             let gnPtr = gnW.buffer.contents().advanced(by: Int(gnW.offset))
                 .assumingMemoryBound(to: UInt16.self)
@@ -2940,18 +3021,20 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 md += dd; mx = max(mx, dd); sa += abs(o[i])
             }
             let rel = (md / Float(d)) / max(1e-6, sa / Float(d))
-            q38DebugDump("refGDNoOut", "rel=\(rel) maxDiff=\(mx) \(rel < 0.08 ? "PASS" : "FAIL")")
+            q38DebugDump("refGDNoOut.p\(p)", "rel=\(rel) maxDiff=\(mx) \(rel < 0.08 ? "PASS" : "FAIL")")
         } catch {
             q38DebugDump("refGDN", "error \(error)")
         }
     }
-
     /// L3 QSA check (position 0, single KV): CPU V/gate/o_proj path vs GPU
     /// `oOut`. At position 0 attention is trivial (weight 1.0 on the only
     /// key) and RoPE is the identity, so this validates V + gate + o_proj +
     /// norms with real weights; scores/softmax/RoPE need a later position.
+    /// At position 1 the full two-key path (cache slots, RoPE'd Q, scores,
+    /// softmax, repeat) is verified against the KV cache.
     private func q38DebugRefCheckQSA(attnIn: MTLBuffer, oOut: MTLBuffer,
-                                      compactV: MTLBuffer, layer L: Int) {
+                                    compactV: MTLBuffer, layer L: Int,
+                                    position p: Int, kv cache: KVCacheManager) {
         do {
             let nQ = cfg.numHeads
             let nKV = cfg.numFullKVHeads
@@ -3013,34 +3096,40 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 md += dd; mx = max(mx, dd); sa += abs(o[i])
             }
             let rel = (md / Float(d)) / max(1e-6, sa / Float(d))
-            q38DebugDump("refQSAoOut", "rel=\(rel) maxDiff=\(mx) \(rel < 0.08 ? "PASS" : "FAIL")")
+            if p == 0 {
+                q38DebugDump("refQSAoOut", "rel=\(rel) maxDiff=\(mx) \(rel < 0.08 ? "PASS" : "FAIL")")
+            }
             // V-only isolation: post-gather compactV vs CPU V (catches K/V
             // dequant, cache write/read, gather).
-            do {
-                let cp = compactV.contents().assumingMemoryBound(to: UInt16.self)
-                var mdv: Float = 0, mxv: Float = 0, sav: Float = 0
-                for i in 0..<kvDim {
-                    let dd = abs(vv[i] - Self.q38F32(cp[i]))
-                    mdv += dd; mxv = max(mxv, dd); sav += abs(vv[i])
+            if p == 0 {
+                do {
+                    let cp = compactV.contents().assumingMemoryBound(to: UInt16.self)
+                    var mdv: Float = 0, mxv: Float = 0, sav: Float = 0
+                    for i in 0..<kvDim {
+                        let dd = abs(vv[i] - Self.q38F32(cp[i]))
+                        mdv += dd; mxv = max(mxv, dd); sav += abs(vv[i])
+                    }
+                    let relv = (mdv / Float(kvDim)) / max(1e-6, sav / Float(kvDim))
+                    q38DebugDump("refQSAv", "rel=\(relv) maxDiff=\(mxv) \(relv < 0.05 ? "PASS" : "FAIL")")
                 }
-                let relv = (mdv / Float(kvDim)) / max(1e-6, sav / Float(kvDim))
-                q38DebugDump("refQSAv", "rel=\(relv) maxDiff=\(mxv) \(relv < 0.05 ? "PASS" : "FAIL")")
             }
             // Pre-o_proj isolation: attnOut (V repeated + gate) vs CPU.
-            do {
-                let ap = self.attnOut.contents().assumingMemoryBound(to: UInt16.self)
-                var mda: Float = 0, mxa: Float = 0, saa: Float = 0
-                for i in 0..<qDim {
-                    let dd = abs(attn[i] - Self.q38F32(ap[i]))
-                    mda += dd; mxa = max(mxa, dd); saa += abs(attn[i])
+            if p == 0 {
+                do {
+                    let ap = self.attnOut.contents().assumingMemoryBound(to: UInt16.self)
+                    var mda: Float = 0, mxa: Float = 0, saa: Float = 0
+                    for i in 0..<qDim {
+                        let dd = abs(attn[i] - Self.q38F32(ap[i]))
+                        mda += dd; mxa = max(mxa, dd); saa += abs(attn[i])
+                    }
+                    let rela = (mda / Float(qDim)) / max(1e-6, saa / Float(qDim))
+                    q38DebugDump("refQSAattn", "rel=\(rela) maxDiff=\(mxa) \(rela < 0.05 ? "PASS" : "FAIL")")
                 }
-                let rela = (mda / Float(qDim)) / max(1e-6, saa / Float(qDim))
-                q38DebugDump("refQSAattn", "rel=\(rela) maxDiff=\(mxa) \(rela < 0.05 ? "PASS" : "FAIL")")
             }
             // Gate-only isolation: GPU post-split raw gate vs CPU strided
             // gate. The fused-QKV check covered query rows only; gate rows
             // (odd 256-blocks) were never verified.
-            if let ags = attnGateScratch {
+            if p == 0, let ags = attnGateScratch {
                 let gp = ags.contents().assumingMemoryBound(to: UInt16.self)
                 var mdg: Float = 0, mxg: Float = 0, sag: Float = 0
                 for i in 0..<qDim {
@@ -3049,6 +3138,65 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 }
                 let relg = (mdg / Float(qDim)) / max(1e-6, sag / Float(qDim))
                 q38DebugDump("refQSAgate", "rel=\(relg) maxDiff=\(mxg) \(relg < 0.05 ? "PASS" : "FAIL")")
+            }
+            if p == 1 {
+                // Two-key attention from the KV cache: normed + RoPE'd Q at
+                // pos 1 against cached (already RoPE'd) K, softmax, repeat V.
+                let rotaryDim = Int(Double(hd) * cfg.partialRotaryFactor)
+                var qN: [[Float]] = []
+                for h in 0..<nQ {
+                    let nrm = Qwen38Reference.rmsNorm(
+                        Array(query[(h * hd)..<((h + 1) * hd)]), weight: qw, eps: eps)
+                    qN.append(Qwen38Reference.applyRopeNeoxCPU(
+                        nrm, position: p, headDim: hd, rotaryDim: rotaryDim,
+                        theta: cfg.ropeTheta))
+                }
+                var kk: [[Float]] = [], vvc: [[Float]] = []
+                for t in 0...p {
+                    let ks = cache.kSlot(layer: L, position: t)
+                    let vs = cache.vSlot(layer: L, position: t)
+                    let kp = ks.buffer.contents().advanced(by: ks.offset)
+                        .assumingMemoryBound(to: UInt16.self)
+                    let vp = vs.buffer.contents().advanced(by: vs.offset)
+                        .assumingMemoryBound(to: UInt16.self)
+                    var kr = [Float](repeating: 0, count: kvDim)
+                    var vr = [Float](repeating: 0, count: kvDim)
+                    for i in 0..<kvDim {
+                        kr[i] = Self.q38F32(kp[i])
+                        vr[i] = Self.q38F32(vp[i])
+                    }
+                    kk.append(kr)
+                    vvc.append(vr)
+                }
+                var attn1 = [Float](repeating: 0, count: qDim)
+                for h in 0..<nQ {
+                    var sc = [Float](repeating: 0, count: p + 1)
+                    for t in 0...p {
+                        var dt: Float = 0
+                        for j in 0..<hd { dt += qN[h][j] * kk[t][(h / rep) * hd + j] }
+                        sc[t] = dt * Float(cfg.attentionScale)
+                    }
+                    let mx = sc.max() ?? 0
+                    var ex = sc.map { exp($0 - mx) }
+                    let dn = ex.reduce(0, +)
+                    ex = ex.map { $0 / dn }
+                    let gr = Array(gate[(h * hd)..<((h + 1) * hd)])
+                    for j in 0..<hd {
+                        var ov: Float = 0
+                        for t in 0...p { ov += ex[t] * vvc[t][(h / rep) * hd + j] }
+                        attn1[h * hd + j] = ov / (1.0 + exp(-gr[j]))
+                    }
+                }
+                let o1 = q38DebugGEMV4(view: try model.oProj(layer: L),
+                                      rows: d, cols: qDim, x: attn1)
+                let oPtr1 = oOut.contents().assumingMemoryBound(to: UInt16.self)
+                var md1: Float = 0, mx1: Float = 0, sa1: Float = 0
+                for i in 0..<d {
+                    let dd = abs(o1[i] - Self.q38F32(oPtr1[i]))
+                    md1 += dd; mx1 = max(mx1, dd); sa1 += abs(o1[i])
+                }
+                let rel1 = (md1 / Float(d)) / max(1e-6, sa1 / Float(d))
+                q38DebugDump("refQSAoOut.p1", "rel=\(rel1) maxDiff=\(mx1) \(rel1 < 0.08 ? "PASS" : "FAIL")")
             }
         } catch {
             q38DebugDump("refQSA", "error \(error)")
@@ -3774,7 +3922,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     q38DebugProbe("compactV.L3", compactV, Int(kvDim))
                     q38DebugProbe("attnOut.L3", self.attnOut, cfg.numHeads * headDim)
                     q38DebugDump("selCount.L3", "\(selCount)")
-                    q38DebugRefCheckQSA(attnIn: attnIn, oOut: oOut, compactV: compactV, layer: L)
+                    q38DebugRefCheckQSA(attnIn: attnIn, oOut: oOut, compactV: compactV, layer: L,
+                                         position: position, kv: kv)
                 }
             }
 
@@ -3877,7 +4026,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 if L == 0 {
                     q38DebugRefCheckGate(mlpIn: mlpIn, layer: L)
                     q38DebugRefCheckRouter(mlpIn: mlpIn, layer: L)
-                    q38DebugRefCheckGDN(attnIn: attnIn, oOut: oOut, layer: L)
+                    q38DebugRefCheckGDN(attnIn: attnIn, oOut: oOut, layer: L,
+                                        position: position)
                     let wPtr = outWeights.contents().assumingMemoryBound(to: UInt16.self)
                     var wSum: Float = 0
                     for i in 0..<cfg.topKExperts { wSum += Self.q38F32(wPtr[i]) }
@@ -3891,6 +4041,17 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     let msg = "[q38dbg] router wsum=\(wSum) imax=\(iMax) uniq=\(seen.count)\n"
                     if let d = msg.data(using: .utf8) { FileHandle.standardError.write(d) }
                 }
+            }
+            if dbgQ38 && position == 1 && L == 0 {
+                waitForCompletion(routedCB)
+                q38DebugRefCheckGDN(attnIn: attnIn, oOut: oOut, layer: L,
+                                    position: position)
+            }
+            if dbgQ38 && position == 1 && L == 3 {
+                // cb2 output consumed below; serial queue + routedCB wait
+                // cover it (same guarantee as the position-0 block).
+                q38DebugRefCheckQSA(attnIn: attnIn, oOut: oOut, compactV: compactV, layer: L,
+                                    position: position, kv: kv)
             }
         }
         // Drain per-layer work (serial queue: waiting the last covers all).
