@@ -2596,8 +2596,59 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         q38DebugDump(label, "exp=\(count) have=\(have) min=\(mn) max=\(mx) mean=\(acc/c)")
     }
 
-    private func q38DebugProbe(_ label: String, _ buf: MTLBuffer, _ count: Int) {
-        let ptr = buf.contents().assumingMemoryBound(to: UInt16.self)
+    /// Env-gated group-32 GEMV self-test (synthetic, production widths).
+    /// Row 0: q=1, s=0.01, b=0, x=1 → y = N*0.01. Row 1: q=2, s=0.01,
+    /// b=0.5, x=1 → y = N*0.52. N=2560 covers the fast path (80 groups);
+    /// N=96 covers the remainder path (3 groups). Prints PASS/FAIL.
+    private func q38DebugSelfTestGEMV() {
+        func runCase(n: Int, m: Int, q: UInt8, s: Float, b: Float) -> (Float, Float) {
+            let g = 32
+            let groups = n / g
+            let wBytes = m * n / 2
+            let aBytes = m * groups * 2
+            let dev = ctx.device
+            guard let wBuf = dev.makeBuffer(length: wBytes, options: .storageModeShared),
+                  let sBuf = dev.makeBuffer(length: aBytes, options: .storageModeShared),
+                  let bBuf = dev.makeBuffer(length: aBytes, options: .storageModeShared),
+                  let xBuf = dev.makeBuffer(length: n * 2, options: .storageModeShared),
+                  let yBuf = dev.makeBuffer(length: m * 2, options: .storageModeShared) else {
+                return (Float.nan, Float.nan)
+            }
+            let fill: UInt8 = (q & 0x0F) | ((q & 0x0F) << 4)
+            memset(wBuf.contents(), Int32(fill), wBytes)
+            let sBits = Quantization.bf16Bits(s)
+            let bBits = Quantization.bf16Bits(b)
+            let sPtr = sBuf.contents().assumingMemoryBound(to: UInt16.self)
+            let bPtr = bBuf.contents().assumingMemoryBound(to: UInt16.self)
+            for i in 0..<(m * groups) { sPtr[i] = sBits; bPtr[i] = bBits }
+            let xPtr = xBuf.contents().assumingMemoryBound(to: UInt16.self)
+            let one = Float16(1.0).bitPattern
+            for i in 0..<n { xPtr[i] = one }
+            let yPtr = yBuf.contents().assumingMemoryBound(to: UInt16.self)
+            for i in 0..<m { yPtr[i] = 0 }
+            runSync { cb in
+                self.int4.encode(commandBuffer: cb,
+                                 weights: wBuf, weightsOffset: 0,
+                                 scales: sBuf, scalesOffset: 0,
+                                 biases: bBuf, biasesOffset: 0,
+                                 x: xBuf, y: yBuf,
+                                 m: UInt32(m), n: UInt32(n),
+                                 groupSize: 32)
+            }
+            let oPtr = yBuf.contents().assumingMemoryBound(to: UInt16.self)
+            let y0 = Float(Float16(bitPattern: oPtr[0]))
+            let expected = Float(n) * (Float(q) * s + b)
+            return (y0, expected)
+        }
+        let (yA, eA) = runCase(n: 2560, m: 2, q: 1, s: 0.01, b: 0.0)
+        let (yB, eB) = runCase(n: 96, m: 2, q: 2, s: 0.01, b: 0.5)
+        let okA = abs(yA - eA) / max(1e-6, abs(eA)) < 0.02
+        let okB = abs(yB - eB) / max(1e-6, abs(eB)) < 0.02
+        q38DebugDump("gemv32", "fast y=\(yA) exp=\(eA) \(okA ? "PASS" : "FAIL") "
+            + "rem y=\(yB) exp=\(eB) \(okB ? "PASS" : "FAIL")")
+    }
+
+    private func q38DebugProbe(_ label: String, _ buf: MTLBuffer, _ count: Int) {        let ptr = buf.contents().assumingMemoryBound(to: UInt16.self)
         var mn = Float.infinity
         var mx = -Float.infinity
         var acc: Float = 0
@@ -3000,6 +3051,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 }
                 let hn = try model.attnHcNorm(layer: 0)
                 q38DebugDumpBF16("hcNorm0", hn, count: hc * cfg.hiddenSize)
+                q38DebugSelfTestGEMV()
             } catch {
                 q38DebugDump("dumpError", "\(error)")
             }
