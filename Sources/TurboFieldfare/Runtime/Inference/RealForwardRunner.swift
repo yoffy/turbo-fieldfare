@@ -3807,7 +3807,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         let dbgQ38 = Foundation.getenv("TURBO_FIELDFARE_DEBUG_QWEN38") != nil
         // Deep-cache verification position (default: last prefill token of
         // the 13-token Hello prompt). Exercises full KV/GDN carry.
-        let deepPos = Int(Foundation.getenv("TURBO_FIELDFARE_Q38_DEEPPOS") ?? "") ?? 12
+        let deepPos: Int = {
+            guard let c = Foundation.getenv("TURBO_FIELDFARE_Q38_DEEPPOS") else { return 12 }
+            return Int(String(cString: c)) ?? 12
+        }()
 
         // Embed + 4-branch expand.
         let emb = model.embedding
