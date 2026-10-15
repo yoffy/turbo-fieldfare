@@ -71,6 +71,33 @@ def main() -> None:
                 vs = [bf16_to_f(struct.unpack("<H", raw[i:i + 2])[0]) for i in range(0, len(raw), 2)]
                 print(f"  bf16 first8={[round(v, 6) for v in vs]}")
 
+    # Dequant sanity: row 0 of shared_expert.gate_proj with w = q*s+b.
+    with open(p, "rb") as f:
+        e = by_name.get(
+            "language_model.model.layers.0.mlp.shared_expert.gate_proj.weight")
+        if e is not None:
+            # e = (nameOff,nameLen,dtype,res,fileOff,size,s0,s1,s2,s3,scOff,scSize,bOff,bSize)
+            fileOff, scOff, bOff = e[4], e[10], e[12]
+            ncols = 2560
+            f.seek(fileOff)
+            packed = f.read(ncols // 2)
+            f.seek(scOff)
+            sraw = f.read(80 * 2)
+            f.seek(bOff)
+            braw = f.read(80 * 2)
+            scales = [bf16_to_f(struct.unpack("<H", sraw[i:i + 2])[0]) for i in range(0, len(sraw), 2)]
+            biases = [bf16_to_f(struct.unpack("<H", braw[i:i + 2])[0]) for i in range(0, len(braw), 2)]
+            w = []
+            for i in range(ncols):
+                q = packed[i // 2] & 0x0F if i % 2 == 0 else packed[i // 2] >> 4
+                g = i // 32
+                w.append(q * scales[g] + biases[g])
+            import math
+            mean = sum(w) / len(w)
+            var = sum((x - mean) ** 2 for x in w) / len(w)
+            print(f"\nsharedGate row0 dequant: n={len(w)} mean={mean:.6f} std={math.sqrt(var):.6f} "
+                  f"min={min(w):.6f} max={max(w):.6f}")
+
 
 if __name__ == "__main__":
     main()
