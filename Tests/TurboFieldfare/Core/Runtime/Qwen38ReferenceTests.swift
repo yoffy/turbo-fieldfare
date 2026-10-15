@@ -77,7 +77,12 @@ import Foundation
         let sel = Qwen38Reference.qsaSelectTokens(
             visible: [0, 1, 2, 3, 4, 5],
             blockScores: [0.1, 0.9, 0.5], compress: 2, blockTopK: 1)
-        #expect(sel == [2, 3, 4, 5])
+        #expect(sel == [2, 3])
+        // Incomplete tail always passes through.
+        let selTail = Qwen38Reference.qsaSelectTokens(
+            visible: [0, 1, 2, 3, 4, 5, 6],
+            blockScores: [0.1, 0.9, 0.5], compress: 2, blockTopK: 1)
+        #expect(selTail == [2, 3, 6])
         // Short context: dense passthrough.
         let dense = Qwen38Reference.qsaSelectTokens(
             visible: [0, 1], blockScores: [], compress: 4, blockTopK: 512)
