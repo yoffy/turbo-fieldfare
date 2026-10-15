@@ -3305,6 +3305,44 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         q38DebugDump("refRope", "rel=\(rel) maxDiff=\(mx) \(rel < 0.02 ? "PASS" : "FAIL")")
     }
 
+    /// Expert-identity check (L0): memcmp the delivered blob bytes for
+    /// `experts[0]` against the layer FILE bytes at that expert's recorded
+    /// file offset. Catches streamer cache-slot confusion (right kernel,
+    /// wrong expert's weights) without any dequant math.
+    private func q38DebugRefCheckExpertMap(layer L: Int, experts: [Int],
+                                          blobs: [TensorView]) {
+        do {
+            guard !experts.isEmpty, !blobs.isEmpty else { return }
+            let want = experts[0]
+            let phys = model.routedExpertPhysicalOffsets(layer: L)
+            guard want >= 0 && want < phys.count else {
+                q38DebugDump("refExpMap", "expert \(want) out of range")
+                return
+            }
+            let offs = model.routedExpertOffsets(layer: L)
+            let fileBase = model.packedExpertsLayout.layers[L].file
+            let url = model.directoryURL
+                .appendingPathComponent("packed_experts")
+                .appendingPathComponent(fileBase)
+            let fh = try FileHandle(forReadingFrom: url)
+            defer { try? fh.close() }
+            try fh.seek(toOffset: phys[want] + UInt64(offs.gateWOff))
+            let fileBytes = try fh.read(upToCount: 4096) ?? Data()
+            let b = blobs[0]
+            let bp = b.buffer.contents().advanced(by: Int(b.offset))
+                .assumingMemoryBound(to: UInt8.self)
+            var same = fileBytes.count == 4096
+            if same {
+                for i in 0..<4096 {
+                    if fileBytes[i] != bp[i] { same = false; break }
+                }
+            }
+            q38DebugDump("refExpMap", "expert=\(want) \(same ? "MATCH" : "MISMATCH")")
+        } catch {
+            q38DebugDump("refExpMap", "error \(error)")
+        }
+    }
+
     private func q38DebugProbe(_ label: String, _ buf: MTLBuffer, _ count: Int) {        let ptr = buf.contents().assumingMemoryBound(to: UInt16.self)
         var mn = Float.infinity
         var mx = -Float.infinity
@@ -4028,6 +4066,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     q38DebugRefCheckRouter(mlpIn: mlpIn, layer: L)
                     q38DebugRefCheckGDN(attnIn: attnIn, oOut: oOut, layer: L,
                                         position: position)
+                    q38DebugRefCheckExpertMap(layer: L, experts: experts, blobs: blobs)
                     let wPtr = outWeights.contents().assumingMemoryBound(to: UInt16.self)
                     var wSum: Float = 0
                     for i in 0..<cfg.topKExperts { wSum += Self.q38F32(wPtr[i]) }
