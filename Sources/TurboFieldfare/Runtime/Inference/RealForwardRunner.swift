@@ -2853,6 +2853,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                                 delta: pleGated,
                                                 count: hcHidden)
         }
+        if Foundation.getenv("TURBO_FIELDFARE_DEBUG_QWEN38") != nil {
+            q38DebugProbe("pleGated", pleGated, hcHidden)
+            q38DebugProbe("pleConvOut", pleConvOut, hcHidden)
+        }
     }
 
 
@@ -3199,9 +3203,14 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             routedCB.commit()
             pendingQ38.append(sharedCB)
             pendingQ38.append(routedCB)
-            if dbgQ38 && position == 0 && (L == 0 || L == 3) {
+            if dbgQ38 && position == 0 && L <= 3 {
                 waitForCompletion(routedCB)
                 q38DebugProbe("hyper.L\(L)", hyper, hc * cfg.hiddenSize)
+                q38DebugProbe("attnIn.L\(L)", attnIn, cfg.hiddenSize)
+                q38DebugProbe("oOut.L\(L)", oOut, cfg.hiddenSize)
+                q38DebugProbe("mlpIn.L\(L)", mlpIn, cfg.hiddenSize)
+                q38DebugProbe("h2.L\(L)", h2Buf, cfg.hiddenSize)
+                q38DebugProbe("inj.L\(L)", inj, hc)
             }
         }
         // Drain per-layer work (serial queue: waiting the last covers all).
