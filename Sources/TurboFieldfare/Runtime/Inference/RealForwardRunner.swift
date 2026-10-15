@@ -3651,6 +3651,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 waitForCompletion(cb1)
                 if dbgQ38 && position == 0 && L == 3 {
                     q38DebugProbe("qNormed.L3", qScratch, cfg.numHeads * headDim)
+                    q38DebugProbe("compactV.L3", compactV, Int(kvDim))
+                    q38DebugProbe("attnOut.L3", self.attnOut, cfg.numHeads * headDim)
+                    q38DebugDump("selCount.L3", "\(selCount)")
                     q38DebugRefCheckQPack(attnIn: attnIn, qPacked: qPackedScratch, layer: L)
                     q38DebugRefCheckQSA(attnIn: attnIn, oOut: oOut, compactV: compactV, layer: L)
                 }
