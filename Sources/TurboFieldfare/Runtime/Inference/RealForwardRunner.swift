@@ -3058,7 +3058,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         }
 
         for L in 0..<cfg.numLayers {
-            if let ple = pleLayer, ple == L {
+            // Temporary kill-switch (TURBO_FIELDFARE_DISABLE_PLE=1) to isolate
+            // PLE as the garbage-output suspect. No-op when unset.
+            if let ple = pleLayer, ple == L,
+               Foundation.getenv("TURBO_FIELDFARE_DISABLE_PLE") == nil {
                 try q38PLE(token: token, pleLayer: ple)
             }
             let routerW = try model.router(layer: L)
