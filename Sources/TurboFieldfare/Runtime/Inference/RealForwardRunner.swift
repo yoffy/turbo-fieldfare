@@ -2860,10 +2860,11 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                     rows: qkvDim, cols: d, x: x)
             let z = q38DebugGEMV4(view: try model.linearInProjZ(layer: L),
                                   rows: valDim, cols: d, x: x)
-            let a = q38DebugGEMV4(view: try model.linearInProjA(layer: L),
-                                  rows: nV, cols: d, x: x)
             let b = q38DebugGEMV4(view: try model.linearInProjB(layer: L),
                                   rows: nV, cols: d, x: x)
+            // Note: in_proj_a / A_log / dt_bias only feed the decay `g`, which
+            // multiplies the (zero) fresh state at position 0, so they drop
+            // out of this single-step check by construction.
             // Causal depthwise conv at position 0: past taps are zero, only
             // the newest tap (last column) sees the current input.
             let convW = try model.linearConv1d(layer: L)
@@ -2886,8 +2887,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 let rel = (md / Float(qkvDim)) / max(1e-6, sa / Float(qkvDim))
                 q38DebugDump("refGDNconv", "rel=\(rel) \(rel < 0.05 ? "PASS" : "FAIL")")
             }
-            var q = Array(conv[0..<keyDim])
-            var k = Array(conv[keyDim..<(2 * keyDim)])
+            let q = Array(conv[0..<keyDim])
+            let k = Array(conv[keyDim..<(2 * keyDim)])
             let v = Array(conv[(2 * keyDim)..<qkvDim])
             func l2(_ r: [Float]) -> [Float] {
                 var s: Float = 0
@@ -2907,12 +2908,6 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 vH.append(Array(v[(h * hV)..<((h + 1) * hV)]))
                 zH.append(Array(z[(h * hV)..<((h + 1) * hV)]))
             }
-            let aLogV = try model.linearALog(layer: L)
-            let dtV = try model.linearDtBias(layer: L)
-            let aPtr = aLogV.buffer.contents().advanced(by: Int(aLogV.offset))
-                .assumingMemoryBound(to: UInt16.self)
-            let dPtr = dtV.buffer.contents().advanced(by: Int(dtV.offset))
-                .assumingMemoryBound(to: UInt16.self)
             let rep = nV / nK
             var core = [Float](repeating: 0, count: valDim)
             for h in 0..<nV {
@@ -2971,8 +2966,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                    rows: 2 * qDim, cols: d, x: x)
             let query = Array(qq[0..<qDim])
             let gate = Array(qq[qDim..<(2 * qDim)])
-            let kk = q38DebugGEMV4(view: try model.kProj(layer: L),
-                                   rows: kvDim, cols: d, x: x)
+            // Note: K is unused at position 0 (single-key attention has
+            // weight 1.0 by construction); Q·K scores need a later position.
             let vv = q38DebugGEMV4(view: try model.vProj(layer: L),
                                    rows: kvDim, cols: d, x: x)
             let qNW = try model.qNorm(layer: L)
@@ -3610,9 +3605,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 waitForCompletion(cb1)
                 if dbgQ38 && position == 0 && L == 3 {
                     q38DebugProbe("qNormed.L3", qScratch, cfg.numHeads * headDim)
-                    if let qps = qPackedScratch {
-                        q38DebugRefCheckQPack(attnIn: attnIn, qPacked: qps, layer: L)
-                    }
+                    q38DebugRefCheckQPack(attnIn: attnIn, qPacked: qPackedScratch, layer: L)
                     q38DebugRefCheckQSA(attnIn: attnIn, oOut: oOut, layer: L)
                 }
                 // CPU: query finalize + block finalize into the pooled cache.
