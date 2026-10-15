@@ -3139,9 +3139,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 let relg = (mdg / Float(qDim)) / max(1e-6, sag / Float(qDim))
                 q38DebugDump("refQSAgate", "rel=\(relg) maxDiff=\(mxg) \(relg < 0.05 ? "PASS" : "FAIL")")
             }
-            if p == 1 {
-                // Two-key attention from the KV cache: normed + RoPE'd Q at
-                // pos 1 against cached (already RoPE'd) K, softmax, repeat V.
+            if p >= 1 {
+                // Multi-key attention from the KV cache: normed + RoPE'd Q
+                // at pos p against cached (already RoPE'd) K, softmax over
+                // p+1 keys, repeat V. Covers KV carry, nonzero RoPE, scores.
                 let rotaryDim = Int(Double(hd) * cfg.partialRotaryFactor)
                 var qN: [[Float]] = []
                 for h in 0..<nQ {
@@ -3196,7 +3197,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     md1 += dd; mx1 = max(mx1, dd); sa1 += abs(o1[i])
                 }
                 let rel1 = (md1 / Float(d)) / max(1e-6, sa1 / Float(d))
-                q38DebugDump("refQSAoOut.p1", "rel=\(rel1) maxDiff=\(mx1) \(rel1 < 0.08 ? "PASS" : "FAIL")")
+                q38DebugDump("refQSAoOut.p\(p)", "rel=\(rel1) maxDiff=\(mx1) \(rel1 < 0.08 ? "PASS" : "FAIL")")
             }
         } catch {
             q38DebugDump("refQSA", "error \(error)")
@@ -3804,6 +3805,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         let topK = UInt32(cfg.topKExperts)
         var pendingQ38: [MTLCommandBuffer] = []
         let dbgQ38 = Foundation.getenv("TURBO_FIELDFARE_DEBUG_QWEN38") != nil
+        // Deep-cache verification position (default: last prefill token of
+        // the 13-token Hello prompt). Exercises full KV/GDN carry.
+        let deepPos = Int(Foundation.getenv("TURBO_FIELDFARE_Q38_DEEPPOS") ?? "") ?? 12
 
         // Embed + 4-branch expand.
         let emb = model.embedding
@@ -4185,8 +4189,16 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                     position: position)
             }
             if dbgQ38 && position == 1 && L == 3 {
-                // cb2 output consumed below; serial queue + routedCB wait
-                // cover it (same guarantee as the position-0 block).
+                q38DebugRefCheckQSA(attnIn: attnIn, oOut: oOut, compactV: compactV, layer: L,
+                                    position: position, kv: kv)
+            }
+            if dbgQ38 && position == deepPos && L == 0 {
+                waitForCompletion(routedCB)
+                q38DebugRefCheckGate(mlpIn: mlpIn, layer: L)
+                q38DebugRefCheckRouter(mlpIn: mlpIn, layer: L)
+            }
+            if dbgQ38 && position == deepPos && L == 3 {
+                // cb2 waited unconditionally in the QSA path above.
                 q38DebugRefCheckQSA(attnIn: attnIn, oOut: oOut, compactV: compactV, layer: L,
                                     position: position, kv: kv)
             }
