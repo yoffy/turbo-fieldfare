@@ -2648,6 +2648,59 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             + "rem y=\(yB) exp=\(eB) \(okB ? "PASS" : "FAIL")")
     }
 
+    /// Env-gated CPU-vs-GPU check for the L0 shared-expert gate GEMV with
+    /// REAL weights: dequantizes gate_proj on CPU (same formula as the
+    /// Metal kernel) and compares against `denseScratchGate`. Catches
+    /// nibble-order / scale-layout mismatches with production data that
+    /// synthetic self-tests cannot see.
+    private func q38DebugRefCheckGate(mlpIn: MTLBuffer, layer L: Int) {
+        let proj = sharedExpertProjections[L]
+        let rows = Int(proj.gate.rows)
+        let cols = Int(proj.gate.cols)
+        let g = 32
+        guard cols % g == 0 else {
+            q38DebugDump("refGate", "cols \(cols) not multiple of 32")
+            return
+        }
+        let groups = cols / g
+        let xPtr = mlpIn.contents().assumingMemoryBound(to: UInt16.self)
+        var x = [Float](repeating: 0, count: cols)
+        for i in 0..<cols { x[i] = Self.q38F32(xPtr[i]) }
+        let wBase = proj.gate.weights.contents().advanced(by: proj.gate.weightsOffset)
+        let sBase = proj.gate.scales.contents().advanced(by: proj.gate.scalesOffset)
+        let bBase = proj.gate.biases.contents().advanced(by: proj.gate.biasesOffset)
+        let rowBytes = cols / 2
+        var maxDiff: Float = 0
+        var sumDiff: Float = 0
+        var sumAbs: Float = 0
+        let yPtr = denseScratchGate.contents().assumingMemoryBound(to: UInt16.self)
+        for r in 0..<rows {
+            let wRow = wBase.advanced(by: r * rowBytes).assumingMemoryBound(to: UInt8.self)
+            let sRow = sBase.advanced(by: r * groups * 2).assumingMemoryBound(to: UInt16.self)
+            let bRow = bBase.advanced(by: r * groups * 2).assumingMemoryBound(to: UInt16.self)
+            var packed = [UInt8](repeating: 0, count: rowBytes)
+            var sc = [UInt16](repeating: 0, count: groups)
+            var bi = [UInt16](repeating: 0, count: groups)
+            for i in 0..<rowBytes { packed[i] = wRow[i] }
+            for i in 0..<groups { sc[i] = sRow[i]; bi[i] = bRow[i] }
+            let w = Quantization.dequantizeInt4Affine(
+                Quantization.Int4AffineRow(packed: packed, scales: sc, biases: bi),
+                n: cols, groupSize: g)
+            var acc: Float = 0
+            for i in 0..<cols { acc += w[i] * x[i] }
+            let yGPU = Self.q38F32(yPtr[r])
+            let d = abs(acc - yGPU)
+            maxDiff = max(maxDiff, d)
+            sumDiff += d
+            sumAbs += abs(acc)
+        }
+        let meanDiff = sumDiff / Float(max(1, rows))
+        let meanAbs = sumAbs / Float(max(1, rows))
+        let rel = meanDiff / max(1e-6, meanAbs)
+        q38DebugDump("refGate", "rows=\(rows) cols=\(cols) meanDiff=\(meanDiff) "
+            + "maxDiff=\(maxDiff) rel=\(rel) \(rel < 0.05 ? "PASS" : "FAIL")")
+    }
+
     private func q38DebugProbe(_ label: String, _ buf: MTLBuffer, _ count: Int) {        let ptr = buf.contents().assumingMemoryBound(to: UInt16.self)
         var mn = Float.infinity
         var mx = -Float.infinity
@@ -3359,6 +3412,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 q38DebugProbe("inj.L\(L)", inj, hc)
                 q38DebugProbe("h1.L\(L)", h1Buf, cfg.hiddenSize)
                 if L == 0 {
+                    q38DebugRefCheckGate(mlpIn: mlpIn, layer: L)
                     let wPtr = outWeights.contents().assumingMemoryBound(to: UInt16.self)
                     var wSum: Float = 0
                     for i in 0..<cfg.topKExperts { wSum += Self.q38F32(wPtr[i]) }
