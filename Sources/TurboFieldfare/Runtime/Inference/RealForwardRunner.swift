@@ -2952,6 +2952,34 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 let reln = (mdn / Float(2 * keyDim)) / max(1e-6, san / Float(2 * keyDim))
                 var samp = ""
                 if reln >= 0.05 {
+                    // Diagnose K-region content: stale pre-norm K, or V-derived?
+                    let kPre = Array(conv[keyDim..<(2 * keyDim)])
+                    var mdPre: Float = 0, saPre: Float = 0
+                    for i in 0..<keyDim {
+                        mdPre += abs(kPre[i] - Self.q38F32(gp[keyDim + i]))
+                        saPre += abs(kPre[i])
+                    }
+                    let relPre = (mdPre / Float(keyDim)) / max(1e-9, saPre / Float(keyDim))
+                    // V-derived hypothesis: l2-norm of V's first 2048 (as 16 heads).
+                    var mdV: Float = 0, saV: Float = 0
+                    for h in 0..<nK {
+                        var ss: Float = 0
+                        for j in 0..<hK {
+                            let e = conv[2 * keyDim + h * hK + j]
+                            ss += e * e
+                        }
+                        let inv = 1.0 / sqrt(ss + 1e-6)
+                        for j in 0..<hK {
+                            let a = conv[2 * keyDim + h * hK + j] * inv
+                            let b = Self.q38F32(gp[keyDim + h * hK + j])
+                            mdV += abs(a - b)
+                            saV += abs(a)
+                        }
+                    }
+                    let relV = (mdV / Float(keyDim)) / max(1e-9, saV / Float(keyDim))
+                    samp += " kIsPre=\(String(format: "%.2f", relPre)) kIsVsep=\(String(format: "%.2f", relV))"
+                }
+                if reln >= 0.05 {
                     for j in 0..<4 {
                         samp += "[\(j):\(String(format: "%.4f", qH[0][j]))/\(String(format: "%.4f", Self.q38F32(gp[j])))]"
                     }
