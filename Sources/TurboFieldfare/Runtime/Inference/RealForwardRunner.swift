@@ -4069,6 +4069,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         // GDN-deep: advance the CPU mirror through every prefill position
         // (needed to verify recurrence at depth). Slow (~2 min); opt-in.
         let gdnDeep = Foundation.getenv("TURBO_FIELDFARE_Q38_GDNDEEP") != nil
+        // All-layer sweep for single-tensor corruption (~6 min); opt-in.
+        let sweepQ38 = Foundation.getenv("TURBO_FIELDFARE_Q38_SWEEP") != nil
 
         // Embed + 4-branch expand.
         let emb = model.embedding
@@ -4442,6 +4444,18 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     }
                     let msg = "[q38dbg] router wsum=\(wSum) imax=\(iMax) uniq=\(seen.count)\n"
                     if let d = msg.data(using: .utf8) { FileHandle.standardError.write(d) }
+                }
+                // All-layer sweep (opt-in): GDN-oOut for linear layers,
+                // QSA-oOut for full layers. Catches single-tensor repack
+                // corruption hiding in unchecked layers.
+                if sweepQ38 && L > 0 {
+                    if cfg.layerIsLinear(L) {
+                        q38DebugRefCheckGDN(attnIn: attnIn, oOut: oOut, layer: L,
+                                            position: position)
+                    } else {
+                        q38DebugRefCheckQSA(attnIn: attnIn, oOut: oOut, compactV: compactV, layer: L,
+                                            position: position, kv: kv)
+                    }
                 }
             }
             if dbgQ38 && (position == 1 || (gdnDeep && position > 1 && position <= 13)) && L == 0 {
