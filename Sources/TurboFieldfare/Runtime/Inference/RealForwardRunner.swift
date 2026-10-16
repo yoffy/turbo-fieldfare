@@ -3074,11 +3074,18 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             if let yb = gdnY {
                 let yp = yb.contents().assumingMemoryBound(to: UInt16.self)
                 var mdy: Float = 0, mxy: Float = 0, say: Float = 0
+                var ratioAcc: Float = 0
+                var ratioN = 0
                 for i in 0..<valDim {
                     let dd = abs(core[i] - Self.q38F32(yp[i]))
                     mdy += dd; mxy = max(mxy, dd); say += abs(core[i])
+                    if abs(core[i]) > 0.001 {
+                        ratioAcc += Self.q38F32(yp[i]) / core[i]
+                        ratioN += 1
+                    }
                 }
                 let rely = (mdy / Float(valDim)) / max(1e-6, say / Float(valDim))
+                let med = ratioN > 0 ? ratioAcc / Float(ratioN) : 0
                 var worst = ""
                 if rely >= 0.05 {
                     var diffs: [(Int, Float, Float)] = []
@@ -3089,7 +3096,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     }
                     worst = " worst=" + diffs.map { "[\($0.0):cpu\(String(format: "%.4f", $0.1))/gpu\(String(format: "%.4f", $0.2))]" }.joined()
                 }
-                q38DebugDump("refGDNcore.L\(L)", "rel=\(rely) \(rely < 0.05 ? "PASS" : "FAIL")\(worst)")
+                q38DebugDump("refGDNcore.L\(L)", "rel=\(rely) meanRatio=\(med) \(rely < 0.05 ? "PASS" : "FAIL")\(worst)")
             }
             if let go = gdnOut {
                 let gp = go.contents().assumingMemoryBound(to: UInt16.self)
