@@ -2865,6 +2865,16 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             for i in 0..<d { x[i] = Self.q38F32(xPtr[i]) }
             let qkv = q38DebugGEMV4(view: try model.linearInProjQKV(layer: L),
                                     rows: qkvDim, cols: d, x: x)
+            if let qraw = gdnQKVRaw {
+                let qp = qraw.contents().assumingMemoryBound(to: UInt16.self)
+                var mdq: Float = 0, mxq: Float = 0, saq: Float = 0
+                for i in 0..<qkvDim {
+                    let dd = abs(qkv[i] - Self.q38F32(qp[i]))
+                    mdq += dd; mxq = max(mxq, dd); saq += abs(qkv[i])
+                }
+                let relq = (mdq / Float(qkvDim)) / max(1e-6, saq / Float(qkvDim))
+                q38DebugDump("refGDNqkv.L\(L)", "rel=\(relq) \(relq < 0.05 ? "PASS" : "FAIL")")
+            }
             let z = q38DebugGEMV4(view: try model.linearInProjZ(layer: L),
                                   rows: valDim, cols: d, x: x)
             let b = q38DebugGEMV4(view: try model.linearInProjB(layer: L),
