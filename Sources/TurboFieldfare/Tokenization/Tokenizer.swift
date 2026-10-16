@@ -340,6 +340,10 @@ public struct GFTokenizer: @unchecked Sendable {
     /// `add_generation_prompt` + `enable_thinking=false` branch.
     private static let chatMLGenerationSuffix =
         "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    /// Thinking-enabled suffix (`<think>\n`, model thinks first). Selected
+    /// by TURBO_FIELDFARE_THINKING=1 for diagnosis; upstream default.
+    private static let chatMLThinkingSuffix =
+        "<|im_start|>assistant\n<think>\n"
 
     public func applyChatTemplate(_ messages: [Message]) throws -> String {
         switch dialect {
@@ -377,7 +381,11 @@ public struct GFTokenizer: @unchecked Sendable {
             }
             s += Self.imStartMark + message.role.rawValue + "\n" + content + Self.imEndMark + "\n"
         }
-        s += Self.chatMLGenerationSuffix
+        if Foundation.getenv("TURBO_FIELDFARE_THINKING") != nil {
+            s += Self.chatMLThinkingSuffix
+        } else {
+            s += Self.chatMLGenerationSuffix
+        }
         return s
     }
 
