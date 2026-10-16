@@ -3440,6 +3440,70 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         q38DebugDump("refRouted", "rel=\(rel) maxDiff=\(mx) \(rel < 0.08 ? "PASS" : "FAIL")")
     }
 
+    /// Mixer check: CPU `Qwen38Reference.gatedResidual` (no combine) with
+    /// real weights vs GPU `normed`. Covers hc_norm/down/up/silu/sigmoid/
+    /// mean -- the same machinery every layer's hyper-mix uses, verified
+    /// here once with 48-deep real hyper state.
+    private func q38DebugRefCheckMixer(hyper: MTLBuffer, mixed: MTLBuffer) {
+        let hc = cfg.hcCount
+        let d = cfg.hiddenSize
+        let hcHidden = hc * d
+        let lowrank = cfg.hcLowrank
+        let hp = hyper.contents().assumingMemoryBound(to: UInt16.self)
+        var hyperIn = [Float](repeating: 0, count: hcHidden)
+        for i in 0..<hcHidden { hyperIn[i] = Self.q38F32(hp[i]) }
+        func debf16(_ view: TensorView) -> [Float] {
+            let p = view.buffer.contents().advanced(by: Int(view.offset))
+                .assumingMemoryBound(to: UInt16.self)
+            let n = Int(view.length) / 2
+            var o = [Float](repeating: 0, count: n)
+            for i in 0..<n { o[i] = Quantization.bf16ToFloat(p[i]) }
+            return o
+        }
+        let normW = debf16(model.mixerHcNorm)
+        let downW = q38DebugGEMV4Raw(view: model.mixerDown, rows: lowrank, cols: hcHidden)
+        let upW = q38DebugGEMV4Raw(view: model.mixerUp, rows: hcHidden, cols: lowrank)
+        let ref = Qwen38Reference.gatedResidual(
+            hyperInput: hyperIn, hcCount: hc, hidden: d, lowrank: lowrank,
+            hcNormWeight: normW, downWeight: downW, upWeight: upW,
+            blockInjectWeight: nil)
+        let mp = mixed.contents().assumingMemoryBound(to: UInt16.self)
+        var md: Float = 0, mx: Float = 0, sa: Float = 0
+        for i in 0..<d {
+            let dd = abs(ref.mixed[i] - Self.q38F32(mp[i]))
+            md += dd; mx = max(mx, dd); sa += abs(ref.mixed[i])
+        }
+        let rel = (md / Float(d)) / max(1e-6, sa / Float(d))
+        q38DebugDump("refMixer", "rel=\(rel) maxDiff=\(mx) \(rel < 0.08 ? "PASS" : "FAIL")")
+    }
+
+    /// Raw INT4-g32 dequant of a full view to row-major [Float] (for the
+    /// reference hyper-mix check).
+    private func q38DebugGEMV4Raw(view: TensorView, rows: Int, cols: Int) -> [Float] {
+        let g = 32
+        let groups = cols / g
+        let rowBytes = cols / 2
+        let wBase = view.buffer.contents().advanced(by: Int(view.offset))
+        let sBase = view.buffer.contents().advanced(by: Int(view.scaleOffset))
+        let bBase = view.buffer.contents().advanced(by: Int(view.biasOffset))
+        var out = [Float](repeating: 0, count: rows * cols)
+        for r in 0..<rows {
+            let wRow = wBase.advanced(by: r * rowBytes).assumingMemoryBound(to: UInt8.self)
+            let sRow = sBase.advanced(by: r * groups * 2).assumingMemoryBound(to: UInt16.self)
+            let bRow = bBase.advanced(by: r * groups * 2).assumingMemoryBound(to: UInt16.self)
+            var packed = [UInt8](repeating: 0, count: rowBytes)
+            var sc = [UInt16](repeating: 0, count: groups)
+            var bi = [UInt16](repeating: 0, count: groups)
+            for i in 0..<rowBytes { packed[i] = wRow[i] }
+            for i in 0..<groups { sc[i] = sRow[i]; bi[i] = bRow[i] }
+            let w = Quantization.dequantizeInt4Affine(
+                Quantization.Int4AffineRow(packed: packed, scales: sc, biases: bi),
+                n: cols, groupSize: g)
+            for i in 0..<cols { out[r * cols + i] = w[i] }
+        }
+        return out
+    }
+
     private func q38DebugProbe(_ label: String, _ buf: MTLBuffer, _ count: Int) {        let ptr = buf.contents().assumingMemoryBound(to: UInt16.self)
         var mn = Float.infinity
         var mx = -Float.infinity
@@ -4227,6 +4291,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         }
         if dbgQ38 && position == 0 {
             q38DebugProbe("mixer", self.normed, self.cfg.hiddenSize)
+            q38DebugRefCheckMixer(hyper: hyper, mixed: self.normed)
             q38DebugRefCheckHead()
             q38DebugRefCheckRope()
         }
