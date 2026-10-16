@@ -3504,6 +3504,95 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         return out
     }
 
+    /// PLE read-path check (position 0): CPU n-gram rows + SSD reads +
+    /// dequant vs GPU `pleEmbed`, then key/value GEMVs + grouped norms vs
+    /// GPU `pleKey`/`pleValue` (post-norm, in-place). Covers row selection,
+    /// sharding, and uploads with real tokens -- the highest-risk PLE part.
+    private func q38DebugRefCheckPLE(token: Int32, pleLayer L: Int) {
+        do {
+            guard let pleReader, let pleEmbed = q38PleEmbed,
+                  let pleKey = q38PleKey, let pleValue = q38PleValue else { return }
+            let ngramSize = cfg.pleNgramSize
+            let headsPerNgram = cfg.pleHeadsPerNgram
+            let ngramHeads = (ngramSize - 1) * headsPerNgram
+            let contextLen = ngramSize - 1
+            var window = q38PleHistory.suffix(contextLen).map { Int($0) }
+            while window.count < contextLen { window.insert(Int(q38PleEos), at: 0) }
+            window.append(Int(token))
+            let multView = try model.pleMultipliers(layer: L)
+            let offView = try model.pleHeadsOffsets(layer: L)
+            let vszView = try model.pleHeadsVocabSizes(layer: L)
+            let multPtr = multView.buffer.contents().advanced(by: Int(multView.offset))
+                .assumingMemoryBound(to: UInt64.self)
+            let offPtr = offView.buffer.contents().advanced(by: Int(offView.offset))
+                .assumingMemoryBound(to: Int64.self)
+            let vszPtr = vszView.buffer.contents().advanced(by: Int(vszView.offset))
+                .assumingMemoryBound(to: Int64.self)
+            let multipliers = (0..<ngramSize).map { multPtr[$0] }
+            let headOffsets = (0..<ngramHeads).map { Int(offPtr[$0]) }
+            let headVocabSizes = (0..<ngramHeads).map { Int(vszPtr[$0]) }
+            let rows = Qwen38Reference.ngramRowIds(
+                history: window, seqLen: 1, ngramSize: ngramSize,
+                headsPerNgram: headsPerNgram, multipliers: multipliers,
+                headVocabSizes: headVocabSizes, headOffsets: headOffsets,
+                eosId: Int(q38PleEos))
+            let rps = try pleReader.rowsPerShard
+            let headDim = cfg.pleEmbedDim / ngramHeads
+            let embPtr = pleEmbed.contents().assumingMemoryBound(to: UInt16.self)
+            var md: Float = 0, mx: Float = 0, sa: Float = 0
+            for h in 0..<ngramHeads {
+                let vec = try pleReader.readRow(globalRow: rows[0][h], rowsPerShard: rps)
+                for dd in 0..<headDim {
+                    let a = vec[dd]
+                    let b = Self.q38F32(embPtr[h * headDim + dd])
+                    let dff = abs(a - b)
+                    md += dff; mx = max(mx, dff); sa += abs(a)
+                }
+            }
+            let n = Float(ngramHeads * headDim)
+            let rel = (md / n) / max(1e-6, sa / n)
+            q38DebugDump("refPLEembed", "rel=\(rel) maxDiff=\(mx) \(rel < 0.05 ? "PASS" : "FAIL")")
+            // Key/value projections + grouped norms.
+            let eps: Float = 1e-6
+            let hc = cfg.hcCount
+            let d = cfg.hiddenSize
+            var emb = [Float](repeating: 0, count: cfg.pleEmbedDim)
+            for i in 0..<cfg.pleEmbedDim { emb[i] = Self.q38F32(embPtr[i]) }
+            let keyW = try model.pleKeyProj(layer: L)
+            let valW = try model.pleValueProj(layer: L)
+            let nKeyW = try model.pleNormKey(layer: L)
+            let kk = q38DebugGEMV4(view: keyW, rows: hc * d, cols: cfg.pleEmbedDim, x: emb)
+            let vv2 = q38DebugGEMV4(view: valW, rows: d, cols: cfg.pleEmbedDim, x: emb)
+            func readW(_ v: TensorView) -> [Float] {
+                let p = v.buffer.contents().advanced(by: Int(v.offset))
+                    .assumingMemoryBound(to: UInt16.self)
+                let c = Int(v.length) / 2
+                var o = [Float](repeating: 0, count: c)
+                for i in 0..<c { o[i] = Quantization.bf16ToFloat(p[i]) }
+                return o
+            }
+            let nkw = readW(nKeyW)
+            var keyN = [Float](repeating: 0, count: hc * d)
+            for h in 0..<hc {
+                let nr = Qwen38Reference.rmsNorm(Array(kk[(h * d)..<((h + 1) * d)]),
+                                                weight: Array(nkw[(h * d)..<((h + 1) * d)]),
+                                                groupSize: d, eps: eps)
+                for j in 0..<d { keyN[h * d + j] = nr[j] }
+            }
+            let kp = pleKey.contents().assumingMemoryBound(to: UInt16.self)
+            var mdk: Float = 0, mxk: Float = 0, sak: Float = 0
+            for i in 0..<(hc * d) {
+                let dd = abs(keyN[i] - Self.q38F32(kp[i]))
+                mdk += dd; mxk = max(mxk, dd); sak += abs(keyN[i])
+            }
+            let relk = (mdk / Float(hc * d)) / max(1e-6, sak / Float(hc * d))
+            q38DebugDump("refPLEkey", "rel=\(relk) maxDiff=\(mxk) \(relk < 0.05 ? "PASS" : "FAIL")")
+            _ = vv2
+        } catch {
+            q38DebugDump("refPLE", "error \(error)")
+        }
+    }
+
     private func q38DebugProbe(_ label: String, _ buf: MTLBuffer, _ count: Int) {        let ptr = buf.contents().assumingMemoryBound(to: UInt16.self)
         var mn = Float.infinity
         var mx = -Float.infinity
@@ -3814,6 +3903,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             q38DebugProbe("pleValue", pleValue, D)
             q38DebugProbe("pleGated", pleGated, hcHidden)
             q38DebugProbe("pleConvOut", pleConvOut, hcHidden)
+            if q38PleHistory.isEmpty {
+                q38DebugRefCheckPLE(token: token, pleLayer: L)
+            }
         }
     }
 
