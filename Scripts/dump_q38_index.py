@@ -95,7 +95,29 @@ def main() -> None:
             else:
                 vals = [struct.unpack("<q", raw[i*8:(i+1)*8])[0] for i in range(n)]
             print(f"\n{t}\n  n={n} vals={vals}")
-    # Scan mode: argv[2] substring -> all matching tensors with sizes.
+    # Conv tap diagnosis: per-region per-tap meanabs for a layer's conv1d.
+    # argv[2] "conv:L" e.g. "conv:28".
+    if len(sys.argv) > 2 and sys.argv[2].startswith("conv:"):
+        lay = sys.argv[2].split(":")[1]
+        t = f"language_model.model.layers.{lay}.linear_attn.conv1d.weight"
+        e = by_name.get(t)
+        if e is None:
+            print(t, "NOT FOUND")
+        else:
+            import math as _m
+            fileOff = e[4]
+            # shape [convDim=10240, kernel=4], BF16 row-major assumed
+            with open(p, "rb") as f:
+                f.seek(fileOff)
+                raw = f.read(10240 * 4 * 2)
+            vals = [bf16_to_f(struct.unpack("<H", raw[i:i + 2])[0]) for i in range(0, len(raw), 2)]
+            for name, lo, hi in [("q", 0, 2048), ("k", 2048, 4096), ("v", 4096, 10240)]:
+                row = []
+                for tt in range(4):
+                    s = sum(abs(vals[(c * 4 + tt)]) for c in range(lo, hi)) / (hi - lo)
+                    row.append(f"{s:.6f}")
+                print(f"L{lay} {name}: taps={row}")
+        return
     if len(sys.argv) > 2:
         sub = sys.argv[2]
         for t in sorted(by_name):
