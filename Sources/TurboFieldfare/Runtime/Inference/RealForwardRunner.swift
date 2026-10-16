@@ -3249,8 +3249,19 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 rmsEps: eps, groupSize: attnGroup, skipNorm: true)
         }
         let fused = Int(tokBuf.contents().load(as: UInt32.self))
+        var top: [(Int, Float)] = []
+        for i in 0..<vocab {
+            let v = Self.q38F32(lPtr[i])
+            top.append((i, v))
+            if top.count > 5 {
+                top.sort { $0.1 < $1.1 }
+                top.removeFirst()
+            }
+        }
+        top.sort { $0.1 > $1.1 }
+        let desc = top.map { "\($0.0):\(String(format: "%.2f", $0.1))" }.joined(separator: " ")
         q38DebugDump("refHead", "nonfused=\(best) fused=\(fused) "
-            + "\(best == fused ? "PASS" : "FAIL")")
+            + "\(best == fused ? "PASS" : "FAIL") top5=[\(desc)]")
     }
 
     /// RoPE unit check (no model data): synthetic ramp vector through
