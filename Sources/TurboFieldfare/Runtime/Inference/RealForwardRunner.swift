@@ -2955,6 +2955,16 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     for j in 0..<4 {
                         samp += "[\(j):\(String(format: "%.4f", qH[0][j]))/\(String(format: "%.4f", Self.q38F32(gp[j])))]"
                     }
+                    var wd: [(Int, Float, Float)] = []
+                    for h in 0..<nK {
+                        for j in 0..<hK {
+                            let a = qH[h][j], b = Self.q38F32(gp[h * hK + j])
+                            if abs(a - b) > 0.01 { wd.append((h * hK + j, a, b)) }
+                            if wd.count >= 8 { break }
+                        }
+                        if wd.count >= 8 { break }
+                    }
+                    samp += " big=" + wd.map { "[\($0.0):\(String(format: "%.3f", $0.1))/\(String(format: "%.3f", $0.2))]" }.joined()
                 }
                 q38DebugDump("refGDNqknorm.L\(L)", "rel=\(reln) \(reln < 0.05 ? "PASS" : "FAIL")\(samp)")
             }
