@@ -2965,6 +2965,15 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                         if wd.count >= 8 { break }
                     }
                     samp += " big=" + wd.map { "[\($0.0):\(String(format: "%.3f", $0.1))/\(String(format: "%.3f", $0.2))]" }.joined()
+                    samp += " perhead="
+                    for h in 0..<nK {
+                        var mh: Float = 0, sh: Float = 0
+                        for j in 0..<hK {
+                            mh += abs(qH[h][j] - Self.q38F32(gp[h * hK + j]))
+                            sh += abs(qH[h][j])
+                        }
+                        samp += "h\(h):\(String(format: "%.2f", (mh / Float(hK)) / max(1e-9, sh / Float(hK)))) "
+                    }
                 }
                 q38DebugDump("refGDNqknorm.L\(L)", "rel=\(reln) \(reln < 0.05 ? "PASS" : "FAIL")\(samp)")
             }
