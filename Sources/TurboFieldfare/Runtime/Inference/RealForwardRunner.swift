@@ -3026,6 +3026,18 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     }
                 }
                 q38DebugDump("refGDNqknorm.L\(L)", "rel=\(reln) \(reln < 0.05 ? "PASS" : "FAIL")\(samp) preRMS q=\(String(format: "%.4f", rq)) k=\(String(format: "%.4f", rk)) v=\(String(format: "%.4f", rv))")
+                if reln >= 0.05 {
+                    func rrms(_ a: [Float]) -> Float {
+                        var s: Float = 0
+                        for e in a { s += e * e }
+                        return sqrt(s / Float(max(1, a.count)))
+                    }
+                    // qkv = pre-conv GEMV output; conv = post-conv. Localize death.
+                    let qkvQ = rrms(Array(qkv[0..<keyDim]))
+                    let qkvK = rrms(Array(qkv[keyDim..<(2 * keyDim)]))
+                    let qkvV = rrms(Array(qkv[(2 * keyDim)..<qkvDim]))
+                    q38DebugDump("refGDNqkvRMS.L\(L)", "q=\(String(format: "%.4f", qkvQ)) k=\(String(format: "%.4f", qkvK)) v=\(String(format: "%.4f", qkvV))")
+                }
             }
             let rep = nV / nK
             // Recurrent step: fresh (S=0) at position 0, mirror state after.
