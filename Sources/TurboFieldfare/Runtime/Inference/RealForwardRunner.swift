@@ -4444,7 +4444,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     if let d = msg.data(using: .utf8) { FileHandle.standardError.write(d) }
                 }
             }
-            if dbgQ38 && (position == 1 || (gdnDeep && position > 1 && position <= 12)) && L == 0 {
+            if dbgQ38 && (position == 1 || (gdnDeep && position > 1 && position <= 13)) && L == 0 {
                 waitForCompletion(routedCB)
                 q38DebugRefCheckGDN(attnIn: attnIn, oOut: oOut, layer: L,
                                     position: position)
