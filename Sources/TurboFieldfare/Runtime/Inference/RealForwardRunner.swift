@@ -3522,7 +3522,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     private func q38DebugRefCheckPLE(token: Int32, pleLayer L: Int) {
         do {
             guard let pleReader, let pleEmbed = q38PleEmbed,
-                  let pleKey = q38PleKey, let pleValue = q38PleValue else { return }
+                  let pleKey = q38PleKey else { return }
             let ngramSize = cfg.pleNgramSize
             let headsPerNgram = cfg.pleHeadsPerNgram
             let ngramHeads = (ngramSize - 1) * headsPerNgram
@@ -3664,7 +3664,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             let convW = try model.pleConv1d(layer: L)
             let cwPtr = convW.buffer.contents().advanced(by: Int(convW.offset))
                 .assumingMemoryBound(to: UInt16.self)
-            let kernel = cfg.pleConvKernelSize
+            let kernel = 4 // matches the encodeShortConvStep call in q38PLE
             var convOut = [Float](repeating: 0, count: hcHidden)
             for c in 0..<hcHidden {
                 // Fresh zero state: only the newest tap (t = kernel-1,
