@@ -95,7 +95,15 @@ def main() -> None:
             else:
                 vals = [struct.unpack("<q", raw[i*8:(i+1)*8])[0] for i in range(n)]
             print(f"\n{t}\n  n={n} vals={vals}")
-    # Dequant sanity: embed rows for <|im_start|> (248045) and "Hello" (9419).
+    # Scan mode: argv[2] substring -> all matching tensors with sizes.
+    if len(sys.argv) > 2:
+        sub = sys.argv[2]
+        for t in sorted(by_name):
+            if sub in t:
+                e = by_name[t]
+                print(f"{t} shape=({e[6]},{e[7]},{e[8]},{e[9]}) "
+                      f"w={e[5]}B sc={e[11]}B b={e[13]}B")
+        return
     with open(p, "rb") as f:
         e = by_name.get("language_model.model.embed_tokens.weight")
         if e is not None:
