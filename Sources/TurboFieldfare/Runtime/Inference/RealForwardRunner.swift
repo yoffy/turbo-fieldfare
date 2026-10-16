@@ -3024,6 +3024,38 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             }
             let o = q38DebugGEMV4(view: try model.linearOutProj(layer: L),
                                  rows: d, cols: valDim, x: gated)
+            // Intermediate localizations (no extra GEMVs): z (post in-proj),
+            // core (post delta rule), gated (post gated-norm).
+            if let zb = gdnZ {
+                let zp = zb.contents().assumingMemoryBound(to: UInt16.self)
+                var mdz: Float = 0, mxz: Float = 0, saz: Float = 0
+                for i in 0..<valDim {
+                    let dd = abs(z[i] - Self.q38F32(zp[i]))
+                    mdz += dd; mxz = max(mxz, dd); saz += abs(z[i])
+                }
+                let relz = (mdz / Float(valDim)) / max(1e-6, saz / Float(valDim))
+                q38DebugDump("refGDNz.L\(L)", "rel=\(relz) \(relz < 0.05 ? "PASS" : "FAIL")")
+            }
+            if let yb = gdnY {
+                let yp = yb.contents().assumingMemoryBound(to: UInt16.self)
+                var mdy: Float = 0, mxy: Float = 0, say: Float = 0
+                for i in 0..<valDim {
+                    let dd = abs(core[i] - Self.q38F32(yp[i]))
+                    mdy += dd; mxy = max(mxy, dd); say += abs(core[i])
+                }
+                let rely = (mdy / Float(valDim)) / max(1e-6, say / Float(valDim))
+                q38DebugDump("refGDNcore.L\(L)", "rel=\(rely) \(rely < 0.05 ? "PASS" : "FAIL")")
+            }
+            if let go = gdnOut {
+                let gp = go.contents().assumingMemoryBound(to: UInt16.self)
+                var mdg2: Float = 0, mxg2: Float = 0, sag2: Float = 0
+                for i in 0..<valDim {
+                    let dd = abs(gated[i] - Self.q38F32(gp[i]))
+                    mdg2 += dd; mxg2 = max(mxg2, dd); sag2 += abs(gated[i])
+                }
+                let relg2 = (mdg2 / Float(valDim)) / max(1e-6, sag2 / Float(valDim))
+                q38DebugDump("refGDNout.L\(L)", "rel=\(relg2) \(relg2 < 0.05 ? "PASS" : "FAIL")")
+            }
             let oPtr = oOut.contents().assumingMemoryBound(to: UInt16.self)
             var md: Float = 0, mx: Float = 0, sa: Float = 0
             for i in 0..<d {
