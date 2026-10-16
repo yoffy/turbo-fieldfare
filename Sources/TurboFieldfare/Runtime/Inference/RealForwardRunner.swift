@@ -2988,6 +2988,18 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     }
                     let relV = (mdV / Float(keyDim)) / max(1e-9, saV / Float(keyDim))
                     samp += " kIsPre=\(String(format: "%.2f", relPre)) kIsVsep=\(String(format: "%.2f", relV))"
+                    samp += " kperhead="
+                    for h in 0..<nK {
+                        var mh: Float = 0, sh: Float = 0, sq: Float = 0
+                        for j in 0..<hK {
+                            mh += abs(kH[h][j] - Self.q38F32(gp[keyDim + h * hK + j]))
+                            sh += abs(kH[h][j])
+                            let e = conv[keyDim + h * hK + j]
+                            sq += e * e
+                        }
+                        let rmsPre = sqrt(sq / Float(hK))
+                        samp += "k\(h):\(String(format: "%.2f", (mh / Float(hK)) / max(1e-9, sh / Float(hK))))/rms\(String(format: "%.1e", rmsPre)) "
+                    }
                 }
                 if reln >= 0.05 {
                     for j in 0..<4 {
