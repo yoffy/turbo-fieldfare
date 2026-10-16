@@ -4537,6 +4537,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 // corruption hiding in unchecked layers.
                 if sweepQ38 && L > 0 {
                     if cfg.layerIsLinear(L) {
+                        if let qr = gdnQKVRaw {
+                            q38DebugProbe("qkvRaw.L\(L)", qr, cfg.linearAttention.qkvDim)
+                        }
                         q38DebugRefCheckGDN(attnIn: attnIn, oOut: oOut, layer: L,
                                             position: position)
                     } else {
