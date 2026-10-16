@@ -3044,7 +3044,17 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     mdy += dd; mxy = max(mxy, dd); say += abs(core[i])
                 }
                 let rely = (mdy / Float(valDim)) / max(1e-6, say / Float(valDim))
-                q38DebugDump("refGDNcore.L\(L)", "rel=\(rely) \(rely < 0.05 ? "PASS" : "FAIL")")
+                var worst = ""
+                if rely >= 0.05 {
+                    var diffs: [(Int, Float, Float)] = []
+                    for i in 0..<valDim {
+                        let dd = abs(core[i] - Self.q38F32(yp[i]))
+                        if dd > mxy * 0.5 { diffs.append((i, core[i], Self.q38F32(yp[i]))) }
+                        if diffs.count >= 8 { break }
+                    }
+                    worst = " worst=" + diffs.map { "[\($0.0):cpu\(String(format: "%.4f", $0.1))/gpu\(String(format: "%.4f", $0.2))]" }.joined()
+                }
+                q38DebugDump("refGDNcore.L\(L)", "rel=\(rely) \(rely < 0.05 ? "PASS" : "FAIL")\(worst)")
             }
             if let go = gdnOut {
                 let gp = go.contents().assumingMemoryBound(to: UInt16.self)
