@@ -306,6 +306,12 @@ public actor ServerModelSession: ServerInferenceBackend {
                     case .prefill:
                         break
                     case .token(_, let tokenID, let delta):
+                        if Foundation.getenv("TURBO_FIELDFARE_DEBUG_QWEN38") != nil {
+                            let msg = "[q38dbg] emit id=\(tokenID) delta=\(delta)\n"
+                            if let d = msg.data(using: .utf8) {
+                                FileHandle.standardError.write(d)
+                            }
+                        }
                         let events = if let decoder {
                             try decoder.consume(tokenID: tokenID, delta: delta)
                         } else {
