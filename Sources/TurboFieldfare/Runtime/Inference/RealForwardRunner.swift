@@ -3604,6 +3604,93 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         }
     }
 
+    /// PLE gate/conv/compose check (position 0, fresh conv state): CPU dots
+    /// + signed-sqrt gate + scaleRows + grouped norm + dilated depthwise
+    /// conv + residual adds vs GPU `pleGated` (final). Needs pre-PLE hyper?
+    /// No -- query norm output `pleQuery` is still in its buffer; dots are
+    /// recomputed from the (intact) normed key/query buffers.
+    private func q38DebugRefCheckPLEGateConv(pleLayer L: Int) {
+        do {
+            guard let pleKey = q38PleKey, let pleQuery = q38PleQuery,
+                  let pleValue = q38PleValue, let pleDots = q38PleDots,
+                  let pleGate = q38PleGate, let pleGated = q38PleGated,
+                  let pleConvState = q38PleConvState else { return }
+            let hc = cfg.hcCount
+            let d = cfg.hiddenSize
+            let hcHidden = hc * d
+            let eps: Float = 1e-6
+            let kPtr = pleKey.contents().assumingMemoryBound(to: UInt16.self)
+            let qPtr = pleQuery.contents().assumingMemoryBound(to: UInt16.self)
+            let vPtr = pleValue.contents().assumingMemoryBound(to: UInt16.self)
+            // Dots (GPU wrote pleDots as FP32; recompute and compare).
+            var dots = [Float](repeating: 0, count: hc)
+            for h in 0..<hc {
+                var acc: Float = 0
+                for j in 0..<d {
+                    acc += Self.q38F32(kPtr[h * d + j]) * Self.q38F32(qPtr[h * d + j])
+                }
+                dots[h] = acc / sqrt(Float(d))
+            }
+            let dPtr = pleDots.contents().assumingMemoryBound(to: Float.self)
+            var md0: Float = 0
+            for h in 0..<hc { md0 = max(md0, abs(dots[h] - dPtr[h])) }
+            // Gate (same CPU code as production) + scaleRows.
+            var gate = [Float](repeating: 0, count: hc)
+            for h in 0..<hc {
+                let mag = sqrt(max(1e-6, abs(dots[h])))
+                gate[h] = (dots[h] >= 0 ? 1.0 : -1.0) * mag
+            }
+            var scaled = [Float](repeating: 0, count: hcHidden)
+            for h in 0..<hc {
+                let s: Float = 1.0 / (1.0 + exp(-gate[h]))
+                for j in 0..<d { scaled[h * d + j] = s * Self.q38F32(vPtr[j]) }
+            }
+            // Grouped norm (1+w) with norm_conv.
+            let nConvW = try model.pleNormConv(layer: L)
+            let nwPtr = nConvW.buffer.contents().advanced(by: Int(nConvW.offset))
+                .assumingMemoryBound(to: UInt16.self)
+            var normed = [Float](repeating: 0, count: hcHidden)
+            for h in 0..<hc {
+                var ms: Float = 0
+                for j in 0..<d { ms += scaled[h * d + j] * scaled[h * d + j] }
+                let inv = 1.0 / sqrt(ms / Float(d) + eps)
+                for j in 0..<d {
+                    let w = Quantization.bf16ToFloat(nwPtr[h * d + j])
+                    normed[h * d + j] = scaled[h * d + j] * inv * (1.0 + w)
+                }
+            }
+            // Dilated depthwise short conv (kernel 4, dilation 3, fresh zero
+            // state) + silu, then two residual adds (gated + conv).
+            let convW = try model.pleConv1d(layer: L)
+            let cwPtr = convW.buffer.contents().advanced(by: Int(convW.offset))
+                .assumingMemoryBound(to: UInt16.self)
+            let kernel = cfg.pleConvKernelSize
+            var convOut = [Float](repeating: 0, count: hcHidden)
+            for c in 0..<hcHidden {
+                // Fresh zero state: only the newest tap (t = kernel-1,
+                // delay 0) sees the current input.
+                let wNew = Quantization.bf16ToFloat(cwPtr[c * kernel + (kernel - 1)])
+                let acc = wNew * normed[c]
+                convOut[c] = acc / (1.0 + exp(-acc)) // silu
+            }
+            var expect = [Float](repeating: 0, count: hcHidden)
+            for i in 0..<hcHidden { expect[i] = normed[i] + convOut[i] }
+            let gPtr = pleGated.contents().assumingMemoryBound(to: UInt16.self)
+            var md: Float = 0, mx: Float = 0, sa: Float = 0
+            for i in 0..<hcHidden {
+                let dd = abs(expect[i] - Self.q38F32(gPtr[i]))
+                md += dd; mx = max(mx, dd); sa += abs(expect[i])
+            }
+            let rel = (md / Float(hcHidden)) / max(1e-6, sa / Float(hcHidden))
+            q38DebugDump("refPLEgate", "dotsDiff=\(md0) rel=\(rel) maxDiff=\(mx) "
+                + "\((md0 < 1e-3 && rel < 0.08) ? "PASS" : "FAIL")")
+            _ = pleConvState
+            _ = pleGate
+        } catch {
+            q38DebugDump("refPLEgate", "error \(error)")
+        }
+    }
+
     private func q38DebugProbe(_ label: String, _ buf: MTLBuffer, _ count: Int) {        let ptr = buf.contents().assumingMemoryBound(to: UInt16.self)
         var mn = Float.infinity
         var mx = -Float.infinity
@@ -3916,6 +4003,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             q38DebugProbe("pleConvOut", pleConvOut, hcHidden)
             if q38PleHistory.isEmpty {
                 q38DebugRefCheckPLE(token: token, pleLayer: L)
+                q38DebugRefCheckPLEGateConv(pleLayer: L)
             }
         }
     }
