@@ -2912,16 +2912,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             }
             // Save tail for the next position (last kernel-1 windows).
             let newTail = Array(window.suffix(kernel - 1))
-            if p == 0, let gco = gdnConvOut {
-                let gp = gco.contents().assumingMemoryBound(to: UInt16.self)
-                var md: Float = 0, mx: Float = 0, sa: Float = 0
-                for i in 0..<qkvDim {
-                    let dd = abs(conv[i] - Self.q38F32(gp[i]))
-                    md += dd; mx = max(mx, dd); sa += abs(conv[i])
-                }
-                let rel = (md / Float(qkvDim)) / max(1e-6, sa / Float(qkvDim))
-                q38DebugDump("refGDNconv", "rel=\(rel) \(rel < 0.05 ? "PASS" : "FAIL")")
-            }
+            // NOTE: gdnConvOut holds POST-QKNorm values (in-place norm), so
+            // pre-norm conv is not directly comparable; normed q/k are
+            // compared after the L2 step below.
             let q = Array(conv[0..<keyDim])
             let k = Array(conv[keyDim..<(2 * keyDim)])
             let v = Array(conv[(2 * keyDim)..<qkvDim])
@@ -2942,6 +2935,22 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             for h in 0..<nV {
                 vH.append(Array(v[(h * hV)..<((h + 1) * hV)]))
                 zH.append(Array(z[(h * hV)..<((h + 1) * hV)]))
+            }
+            // Post-QKNorm compare (gdnConvOut holds normed q/k in place).
+            if let gco = gdnConvOut {
+                let gp = gco.contents().assumingMemoryBound(to: UInt16.self)
+                var mdn: Float = 0, mxn: Float = 0, san: Float = 0
+                for h in 0..<nK {
+                    for j in 0..<hK {
+                        let e1 = abs(qH[h][j] - Self.q38F32(gp[h * hK + j]))
+                        let e2 = abs(kH[h][j] - Self.q38F32(gp[keyDim + h * hK + j]))
+                        mdn += e1 + e2
+                        mxn = max(mxn, max(e1, e2))
+                        san += abs(qH[h][j]) + abs(kH[h][j])
+                    }
+                }
+                let reln = (mdn / Float(2 * keyDim)) / max(1e-6, san / Float(2 * keyDim))
+                q38DebugDump("refGDNqknorm.L\(L)", "rel=\(reln) \(reln < 0.05 ? "PASS" : "FAIL")")
             }
             let rep = nV / nK
             // Recurrent step: fresh (S=0) at position 0, mirror state after.
