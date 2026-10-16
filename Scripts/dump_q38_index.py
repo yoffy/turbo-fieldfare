@@ -37,6 +37,7 @@ def main() -> None:
         by_name = {entry_name(e): e for e in raw_entries}
 
     targets = [
+        "language_model.model.embed_tokens.weight",
         "language_model.model.layers.0.attn_hyper_connection.block_inject_weight.weight",
         "language_model.model.layers.0.mlp.shared_expert.gate_proj.weight",
         "language_model.model.layers.1.ple.value_proj.weight",
@@ -94,6 +95,33 @@ def main() -> None:
             else:
                 vals = [struct.unpack("<q", raw[i*8:(i+1)*8])[0] for i in range(n)]
             print(f"\n{t}\n  n={n} vals={vals}")
+    # Dequant sanity: embed rows for <|im_start|> (248045) and "Hello" (9419).
+    with open(p, "rb") as f:
+        e = by_name.get("language_model.model.embed_tokens.weight")
+        if e is not None:
+            import math as _math2
+            fileOff, scOff, bOff = e[4], e[10], e[12]
+            ncols = 2560
+            rowbytes = ncols // 2
+            for row in [248045, 9419, 846]:
+                f.seek(fileOff + row * rowbytes)
+                packed = f.read(rowbytes)
+                f.seek(scOff + row * 80 * 2)
+                sraw = f.read(80 * 2)
+                f.seek(bOff + row * 80 * 2)
+                braw = f.read(80 * 2)
+                scales = [bf16_to_f(struct.unpack("<H", sraw[i:i + 2])[0]) for i in range(0, len(sraw), 2)]
+                biases = [bf16_to_f(struct.unpack("<H", braw[i:i + 2])[0]) for i in range(0, len(braw), 2)]
+                w = []
+                for i in range(ncols):
+                    q = packed[i // 2] & 0x0F if i % 2 == 0 else packed[i // 2] >> 4
+                    g = i // 32
+                    w.append(q * scales[g] + biases[g])
+                mean = sum(w) / len(w)
+                var = sum((xx - mean) ** 2 for xx in w) / len(w)
+                nr = _math2.sqrt(sum(xx * xx for xx in w))
+                print(f"\nembed row{row}: mean={mean:.6f} std={_math2.sqrt(var):.6f} norm={nr:.4f} "
+                      f"scalesNeg={sum(1 for vv in scales if vv < 0)}/80")
     # Dequant sanity: lm_head rows for "Hello" (9419) and row 0.
     with open(p, "rb") as f:
         e = by_name.get("language_model.lm_head.weight")
