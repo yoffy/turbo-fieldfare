@@ -2938,6 +2938,16 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             }
             // Post-QKNorm compare (gdnConvOut holds normed q/k in place).
             if let gco = gdnConvOut {
+                // Pre-norm region RMS (dead-channel diagnosis): healthy Q/K
+                // have RMS ~0.1-2; near-dead (~1e-4) get eps-amplified noise.
+                func rms(_ r: [Float]) -> Float {
+                    var s: Float = 0
+                    for e in r { s += e * e }
+                    return sqrt(s / Float(max(1, r.count)))
+                }
+                let rq = rms(Array(conv[0..<keyDim]))
+                let rk = rms(Array(conv[keyDim..<(2 * keyDim)]))
+                let rv = rms(Array(conv[(2 * keyDim)..<qkvDim]))
                 let gp = gco.contents().assumingMemoryBound(to: UInt16.self)
                 var mdn: Float = 0, mxn: Float = 0, san: Float = 0
                 for h in 0..<nK {
@@ -3003,7 +3013,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                         samp += "h\(h):\(String(format: "%.2f", (mh / Float(hK)) / max(1e-9, sh / Float(hK)))) "
                     }
                 }
-                q38DebugDump("refGDNqknorm.L\(L)", "rel=\(reln) \(reln < 0.05 ? "PASS" : "FAIL")\(samp)")
+                q38DebugDump("refGDNqknorm.L\(L)", "rel=\(reln) \(reln < 0.05 ? "PASS" : "FAIL")\(samp) preRMS q=\(String(format: "%.4f", rq)) k=\(String(format: "%.4f", rk)) v=\(String(format: "%.4f", rv))")
             }
             let rep = nV / nK
             // Recurrent step: fresh (S=0) at position 0, mirror state after.
