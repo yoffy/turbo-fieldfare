@@ -2950,7 +2950,13 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     }
                 }
                 let reln = (mdn / Float(2 * keyDim)) / max(1e-6, san / Float(2 * keyDim))
-                q38DebugDump("refGDNqknorm.L\(L)", "rel=\(reln) \(reln < 0.05 ? "PASS" : "FAIL")")
+                var samp = ""
+                if reln >= 0.05 {
+                    for j in 0..<4 {
+                        samp += "[\(j):\(String(format: "%.4f", qH[0][j]))/\(String(format: "%.4f", Self.q38F32(gp[j])))]"
+                    }
+                }
+                q38DebugDump("refGDNqknorm.L\(L)", "rel=\(reln) \(reln < 0.05 ? "PASS" : "FAIL")\(samp)")
             }
             let rep = nV / nK
             // Recurrent step: fresh (S=0) at position 0, mirror state after.
