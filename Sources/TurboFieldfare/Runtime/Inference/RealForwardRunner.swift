@@ -3036,6 +3036,16 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 let relz = (mdz / Float(valDim)) / max(1e-6, saz / Float(valDim))
                 q38DebugDump("refGDNz.L\(L)", "rel=\(relz) \(relz < 0.05 ? "PASS" : "FAIL")")
             }
+            if let bb = gdnB {
+                let bp = bb.contents().assumingMemoryBound(to: UInt16.self)
+                var mdb: Float = 0, mxb: Float = 0, sab: Float = 0
+                for i in 0..<nV {
+                    let dd = abs(b[i] - Self.q38F32(bp[i]))
+                    mdb += dd; mxb = max(mxb, dd); sab += abs(b[i])
+                }
+                let relb = (mdb / Float(nV)) / max(1e-6, sab / Float(nV))
+                q38DebugDump("refGDNb.L\(L)", "rel=\(relb) \(relb < 0.05 ? "PASS" : "FAIL")")
+            }
             if let yb = gdnY {
                 let yp = yb.contents().assumingMemoryBound(to: UInt16.self)
                 var mdy: Float = 0, mxy: Float = 0, say: Float = 0
