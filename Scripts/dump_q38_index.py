@@ -96,7 +96,37 @@ def main() -> None:
                 vals = [struct.unpack("<q", raw[i*8:(i+1)*8])[0] for i in range(n)]
             print(f"\n{t}\n  n={n} vals={vals}")
     # Conv tap diagnosis: per-region per-tap meanabs for a layer's conv1d.
-    # argv[2] "conv:L" e.g. "conv:28".
+    # Inject diagnosis: "inject:L" dequantifies attn block_inject rows.
+    if len(sys.argv) > 2 and sys.argv[2].startswith("inject:"):
+        lay = sys.argv[2].split(":")[1]
+        for which in ["attn_hyper_connection", "mlp_hyper_connection"]:
+            t = f"language_model.model.layers.{lay}.{which}.block_inject_weight.weight"
+            e = by_name.get(t)
+            if e is None:
+                print(t, "NOT FOUND")
+                continue
+            import math as _m3
+            fileOff, scOff, bOff = e[4], e[10], e[12]
+            ncols = 10240
+            rowbytes = ncols // 2
+            with open(p, "rb") as f:
+                for row in range(4):
+                    f.seek(fileOff + row * rowbytes)
+                    packed = f.read(rowbytes)
+                    f.seek(scOff + row * 320 * 2)
+                    sraw = f.read(320 * 2)
+                    f.seek(bOff + row * 320 * 2)
+                    braw = f.read(320 * 2)
+                    scales = [bf16_to_f(struct.unpack("<H", sraw[i:i + 2])[0]) for i in range(0, len(sraw), 2)]
+                    biases = [bf16_to_f(struct.unpack("<H", braw[i:i + 2])[0]) for i in range(0, len(braw), 2)]
+                    nr = 0.0
+                    for i in range(ncols):
+                        q = packed[i // 2] & 0x0F if i % 2 == 0 else packed[i // 2] >> 4
+                        g = i // 32
+                        w = q * scales[g] + biases[g]
+                        nr += w * w
+                    print(f"L{lay} {which.split('_')[0]} inject row{row}: norm={_m3.sqrt(nr):.4f}")
+        return
     if len(sys.argv) > 2 and sys.argv[2].startswith("conv:"):
         lay = sys.argv[2].split(":")[1]
         t = f"language_model.model.layers.{lay}.linear_attn.conv1d.weight"
