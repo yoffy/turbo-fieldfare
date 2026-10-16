@@ -3875,6 +3875,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             guard let c = Foundation.getenv("TURBO_FIELDFARE_Q38_DEEPPOS") else { return 12 }
             return Int(String(cString: c)) ?? 12
         }()
+        // GDN-deep: advance the CPU mirror through every prefill position
+        // (needed to verify recurrence at depth). Slow (~2 min); opt-in.
+        let gdnDeep = Foundation.getenv("TURBO_FIELDFARE_Q38_GDNDEEP") != nil
 
         // Embed + 4-branch expand.
         let emb = model.embedding
@@ -4250,7 +4253,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     if let d = msg.data(using: .utf8) { FileHandle.standardError.write(d) }
                 }
             }
-            if dbgQ38 && position == 1 && L == 0 {
+            if dbgQ38 && (position == 1 || (gdnDeep && position > 1 && position <= 12)) && L == 0 {
                 waitForCompletion(routedCB)
                 q38DebugRefCheckGDN(attnIn: attnIn, oOut: oOut, layer: L,
                                     position: position)
