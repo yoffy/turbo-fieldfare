@@ -239,11 +239,6 @@ public actor ServerModelSession: ServerInferenceBackend {
                 param: "messages",
                 code: "context_length_exceeded")
         }
-        if Foundation.getenv("TURBO_FIELDFARE_DEBUG_QWEN38") != nil {
-            let ids = promptIDs.prefix(64).map(String.init).joined(separator: ",")
-            let msg = "[q38dbg] promptIDs n=\(promptIDs.count) ids=[\(ids)]\n"
-            if let d = msg.data(using: .utf8) { FileHandle.standardError.write(d) }
-        }
 
         let effectivePromptIDs: [Int32]
         let completionStart: RawCompletionStart
@@ -306,12 +301,6 @@ public actor ServerModelSession: ServerInferenceBackend {
                     case .prefill:
                         break
                     case .token(_, let tokenID, let delta):
-                        if Foundation.getenv("TURBO_FIELDFARE_DEBUG_QWEN38") != nil {
-                            let msg = "[q38dbg] emit id=\(tokenID) delta=\(delta)\n"
-                            if let d = msg.data(using: .utf8) {
-                                FileHandle.standardError.write(d)
-                            }
-                        }
                         let events = if let decoder {
                             try decoder.consume(tokenID: tokenID, delta: delta)
                         } else {
