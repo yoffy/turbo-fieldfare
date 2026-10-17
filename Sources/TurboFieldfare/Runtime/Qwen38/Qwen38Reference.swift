@@ -423,7 +423,12 @@ public enum Qwen38Reference {
                 let headStart = (ngram - 2) * headsPerNgram
                 for h in 0..<headsPerNgram {
                     let v = headVocabSizes[headStart + h]
-                    let id = Int(mixed % UInt64(v)) + headOffsets[headStart + h]
+                    // torch.remainder on the int64 `mixed` value: floored
+                    // modulo, so a wrapping-negative product still yields a
+                    // non-negative row (differs from unsigned `%`).
+                    var r = Int(bitPattern: mixed) % v
+                    if r < 0 { r += v }
+                    let id = r + headOffsets[headStart + h]
                     row.append(id)
                 }
             }
