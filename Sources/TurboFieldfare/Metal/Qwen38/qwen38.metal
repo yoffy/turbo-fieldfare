@@ -258,10 +258,10 @@ kernel void ple_scale_rows(
 
 // Dilated depthwise short conv, single decode step. State holds the previous
 // (kernel-1)*dilation normed inputs; on entry state = [.., oldest..newest],
-// input = current. Taps read back dilation steps: tap t uses position
-// (S - 1 - t*dilation) in [state | input], where S = stateLen. After the
-// taps, state shifts left by one and appends input. Reference:
-// Qwen4ExpTextPLELayer._short_conv (dilation = ngram_size).
+// input = current. Taps are cross-correlation taps: tap t weights the lag
+// (K-1-t)*dilation, so w[K-1] lands on the current input and w[0] on the
+// oldest state row. After the taps, state shifts left by one and appends
+// input. Reference: Qwen4ExpTextPLELayer._short_conv (dilation = ngram_size).
 kernel void ple_short_conv_step(
     device half*       state  [[buffer(0)]],   // [S, C] FP16, in/out
     device const half* input [[buffer(1)]],   // [C] FP16
@@ -274,10 +274,12 @@ kernel void ple_short_conv_step(
     uint c [[thread_position_in_grid]]
 ) {
     if (c >= channels) return;
-    // Gather taps from [state | input].
+    // Gather taps from [state | input]. Cross-correlation (F.conv1d): tap t
+    // weights the lag (K-1-t)*dilation, so the current input carries w[K-1]
+    // and the oldest state row carries w[0].
     float acc = 0.0f;
     for (uint t = 0; t < kernelSize; ++t) {
-        uint back = t * dilation;
+        uint back = (kernelSize - 1u - t) * dilation;
         float v;
         if (back == 0) {
             v = float(input[c]);
