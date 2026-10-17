@@ -119,16 +119,39 @@ extension Model {
     }
 
     public func fetchRoutedExperts(layer: Int, experts: [Int]) async throws -> [TensorView] {
+        try await fetchRoutedExpertsReportingStats(layer: layer, experts: experts).views
+    }
+
+    /// Cache accounting for one routed-expert fetch: how many requested experts
+    /// were already resident and how many bytes the misses pulled from disk.
+    public struct ExpertFetchStatistics: Sendable, Equatable {
+        public var hits: Int = 0
+        public var misses: Int = 0
+        public var bytesRead: UInt64 = 0
+    }
+
+    /// Same fetch as `fetchRoutedExperts(layer:experts:)` plus the cache
+    /// accounting the hit/miss telemetry needs.
+    public func fetchRoutedExpertsReportingStats(
+        layer: Int,
+        experts: [Int]
+    ) async throws -> (views: [TensorView], stats: ExpertFetchStatistics) {
         try ensureLayerOpened(layer)
         let streamer = streamersQueue.sync { streamersBox.streamers[layer]! }
+        let expertStride = streamer.layout.expertStride
         return try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
-                    let buffers = try streamer.loadExpertsCached(experts: experts)
-                    continuation.resume(returning: Self.makeExpertViews(
+                    let plan = streamer.planExpertsCached(experts: experts)
+                    let buffers = try streamer.executeExpertCachePlan(plan)
+                    let stats = ExpertFetchStatistics(
+                        hits: plan.hits,
+                        misses: plan.misses.count,
+                        bytesRead: UInt64(plan.misses.count) * expertStride)
+                    continuation.resume(returning: (Self.makeExpertViews(
                         buffers,
                         layer: layer,
-                        experts: experts))
+                        experts: experts), stats))
                 } catch {
                     continuation.resume(throwing: error)
                 }

@@ -91,6 +91,52 @@ import Foundation
                 == [false, false, true, true, false])
     }
 
+    @Test func qsaSelectionIsTheDensePrefixInsideTheBlockBudget() {
+        // The decode fast path skips block scoring, top-k and the gather while
+        // `position + 1 <= blockTopK * compress`; inside that window the
+        // reference selection must be exactly the causal prefix, otherwise the
+        // shortcut would change which tokens attention sees.
+        let compress = 4
+        let blockTopK = 512
+        let limit = blockTopK * compress          // 2048 visible tokens
+        for visibleCount in [1, 2, 5, compress, compress + 1, limit - 1, limit] {
+            let visible = Array(0..<visibleCount)
+            var scores = [Float](repeating: 0, count: visibleCount / compress)
+            for i in scores.indices { scores[i] = Float((i % 3) - 1) }
+            let selected = Qwen38Reference.qsaSelectTokens(
+                visible: visible, blockScores: scores,
+                compress: compress, blockTopK: blockTopK)
+            #expect(selected == visible)
+        }
+        // The last dense window is `limit` visible tokens; one full block past
+        // it there are `blockTopK + 1` complete blocks, so exactly one block
+        // (the lowest score) drops out and the selection stops being the whole
+        // prefix. That is the first position the sparse path must handle.
+        let overVisible = Array(0...(limit + compress - 1))   // 2052 tokens
+        var overScores = [Float](repeating: 0, count: overVisible.count / compress)
+        for i in overScores.indices { overScores[i] = Float(i) }
+        let overSelected = Qwen38Reference.qsaSelectTokens(
+            visible: overVisible, blockScores: overScores,
+            compress: compress, blockTopK: blockTopK)
+        #expect(overSelected.count == blockTopK * compress)
+        #expect(overSelected.first == compress)
+        #expect(overSelected.last == limit + compress - 1)
+        #expect(overSelected != overVisible)
+        // Ties are broken by smaller block index, so with `blockTopK + 1`
+        // complete blocks the *highest* index loses the last slot and the
+        // output stays index-ascending (reproducible selection).
+        var tieScores = [Float](repeating: 1, count: overVisible.count / compress)
+        tieScores[7] = 2
+        let tieSelected = Qwen38Reference.qsaSelectTokens(
+            visible: overVisible, blockScores: tieScores,
+            compress: compress, blockTopK: blockTopK)
+        #expect(tieSelected.count == blockTopK * compress)
+        #expect(tieSelected.first == 0)
+        #expect(tieSelected.contains(7 * compress))
+        #expect(!tieSelected.contains(blockTopK * compress))
+        #expect(tieSelected.last == blockTopK * compress - 1)
+    }
+
     @Test func splitmixAndMultipliersMatchUpstream() {
         // `_build_layer_multipliers(248320, 3, ple_layer_index, seed=1234)`.
         let m0 = Qwen38Reference.buildLayerMultipliers(

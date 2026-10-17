@@ -671,6 +671,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     }
 
     public private(set) var totalIoNanos: UInt64 = 0
+    /// Routed-expert cache accounting, accumulated across fetches.
+    public private(set) var totalExpertCacheHits: UInt64 = 0
+    public private(set) var totalExpertCacheMisses: UInt64 = 0
+    public private(set) var totalExpertReadBytes: UInt64 = 0
     public private(set) var totalCb1Nanos: UInt64 = 0
     public private(set) var totalCb2Nanos: UInt64 = 0
     public private(set) var totalHeadNanos: UInt64 = 0
@@ -2613,8 +2617,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     /// the layer tail, and finalizes newly completed `compress`-token blocks
     /// straight into the GPU pooled-key buffer (shared write). Returns the
     /// completed-block count visible to this query.
-    private func q38IndexerPost(layer L: Int, position p: Int) throws -> Int {
-        guard let idxQK = q38IdxQK, let idxQ = q38IdxQ else {
+    private func q38IndexerPost(layer L: Int, position p: Int,
+                                needsQueryScores: Bool = true) throws -> Int {
+        guard let idxQK = q38IdxQK else {
             preconditionFailure("qwen38 indexer without scratch")
         }
         let idxDim = cfg.indexerHeadDim
@@ -2622,32 +2627,39 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         let compress = cfg.indexerCompressRatio
         let rotaryDim = Int(Double(cfg.headDim) * cfg.partialRotaryFactor)
         let eps: Float = 1e-6
-        // Read back the projected row (FP16 shared buffer).
+        // Read back the projected row (FP16 shared buffer). Only the key half
+        // is unconditional; the dense fast path never scores against `idxQ`.
         let src = idxQK.contents().assumingMemoryBound(to: UInt16.self)
-        var qk = [Float](repeating: 0, count: (idxHeads + cfg.indexerKvHeads) * idxDim)
-        for i in 0..<qk.count { qk[i] = Self.q38F32(src[i]) }
-        let qFlat = Array(qk[0..<(idxHeads * idxDim)])
-        let rawKey = Array(qk[(idxHeads * idxDim)...])
-        // Query layernorm (shared [headDim] weight) + RoPE at p.
-        let qNormW = try model.indexerQNorm(layer: L)
-        let qw = qNormW.buffer.contents().advanced(by: Int(qNormW.offset))
-            .assumingMemoryBound(to: UInt16.self)
-        var qWeight = [Float](repeating: 0, count: idxDim)
-        for i in 0..<idxDim { qWeight[i] = Quantization.bf16ToFloat(qw[i]) }
-        var qHeads: [[Float]] = []
-        qHeads.reserveCapacity(idxHeads)
-        for h in 0..<idxHeads {
-            let row = Array(qFlat[(h * idxDim)..<((h + 1) * idxDim)])
-            let normed = Qwen38Reference.rmsNorm(row, weight: qWeight, eps: eps)
-            qHeads.append(Qwen38Reference.applyRopeNeoxCPU(
-                normed, position: p, headDim: idxDim, rotaryDim: rotaryDim,
-                theta: cfg.ropeTheta))
-        }
-        // Publish the query heads to the GPU score buffer input.
-        let qDst = idxQ.contents().assumingMemoryBound(to: UInt16.self)
-        for h in 0..<idxHeads {
-            for d in 0..<idxDim {
-                qDst[h * idxDim + d] = Self.q38F16(qHeads[h][d])
+        let qkOffset = idxHeads * idxDim
+        var rawKey = [Float](repeating: 0, count: cfg.indexerKvHeads * idxDim)
+        for i in 0..<rawKey.count { rawKey[i] = Self.q38F32(src[qkOffset + i]) }
+        if needsQueryScores {
+            guard let idxQ = q38IdxQ else {
+                preconditionFailure("qwen38 indexer without query scratch")
+            }
+            var qFlat = [Float](repeating: 0, count: qkOffset)
+            for i in 0..<qFlat.count { qFlat[i] = Self.q38F32(src[i]) }
+            // Query layernorm (shared [headDim] weight) + RoPE at p.
+            let qNormW = try model.indexerQNorm(layer: L)
+            let qw = qNormW.buffer.contents().advanced(by: Int(qNormW.offset))
+                .assumingMemoryBound(to: UInt16.self)
+            var qWeight = [Float](repeating: 0, count: idxDim)
+            for i in 0..<idxDim { qWeight[i] = Quantization.bf16ToFloat(qw[i]) }
+            var qHeads: [[Float]] = []
+            qHeads.reserveCapacity(idxHeads)
+            for h in 0..<idxHeads {
+                let row = Array(qFlat[(h * idxDim)..<((h + 1) * idxDim)])
+                let normed = Qwen38Reference.rmsNorm(row, weight: qWeight, eps: eps)
+                qHeads.append(Qwen38Reference.applyRopeNeoxCPU(
+                    normed, position: p, headDim: idxDim, rotaryDim: rotaryDim,
+                    theta: cfg.ropeTheta))
+            }
+            // Publish the query heads to the GPU score buffer input.
+            let qDst = idxQ.contents().assumingMemoryBound(to: UInt16.self)
+            for h in 0..<idxHeads {
+                for d in 0..<idxDim {
+                    qDst[h * idxDim + d] = Self.q38F16(qHeads[h][d])
+                }
             }
         }
         // Tail append + block finalization (mean -> k layernorm -> RoPE at
@@ -2890,20 +2902,23 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         let topK = UInt32(cfg.topKExperts)
         var pendingQ38: [MTLCommandBuffer] = []
 
-        // Embed + 4-branch expand.
+        // Embed + 4-branch expand. Committed without a host wait: the serial
+        // queue orders it before the first layer, and nothing on the CPU reads
+        // `hidden`/`hyper`.
         let emb = model.embedding
-        runSync { cb in
-            self.embedInt4.encode(commandBuffer: cb,
-                                  table: emb.buffer, tableOffset: Int(emb.offset),
-                                  scales: emb.buffer, scalesOffset: Int(emb.scaleOffset),
-                                  biases: emb.buffer, biasesOffset: Int(emb.biasOffset),
-                                  out: self.hidden,
-                                  tokenId: UInt32(bitPattern: token),
-                                  d: D, outScale: 1.0,
-                                  groupSize: self.model.embeddingGroupSize)
-            q38.encodeRepeat(commandBuffer: cb, x: self.hidden, y: hyper,
-                             d: self.cfg.hiddenSize, h: hc)
-        }
+        let embedCB = ctx.queue.makeCommandBuffer()!
+        self.embedInt4.encode(commandBuffer: embedCB,
+                              table: emb.buffer, tableOffset: Int(emb.offset),
+                              scales: emb.buffer, scalesOffset: Int(emb.scaleOffset),
+                              biases: emb.buffer, biasesOffset: Int(emb.biasOffset),
+                              out: self.hidden,
+                              tokenId: UInt32(bitPattern: token),
+                              d: D, outScale: 1.0,
+                              groupSize: self.model.embeddingGroupSize)
+        q38.encodeRepeat(commandBuffer: embedCB, x: self.hidden, y: hyper,
+                         d: self.cfg.hiddenSize, h: hc)
+        embedCB.commit()
+        pendingQ38.append(embedCB)
 
         let pleLayer = model.pleLayer()
         let sharedProjViews = sharedExpertProjections
@@ -2918,6 +2933,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             if isLinear {
                 // One CB through the router: attn hyper-mix (with inject),
                 // GDN recurrence, attn inject, mlp hyper-mix (with inject).
+                let tCb1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
                 let cb = ctx.queue.makeCommandBuffer()!
                 try q38HyperMix(cb, hyper: hyper,
                                 normW: try model.attnHcNorm(layer: L),
@@ -2950,10 +2966,12 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     numExperts: UInt32(cfg.numExperts), d: D, topK: topK,
                     weightBits: routerWeightBits)
                 cb.commit()
+                totalCb1Nanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tCb1
                 waitForCompletion(cb)
             } else {
                 // CB1: attn hyper-mix (with inject), packed q/k/v, per-head
                 // norms, RoPE, indexer projection.
+                let tCb1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
                 let cb1 = ctx.queue.makeCommandBuffer()!
                 try q38HyperMix(cb1, hyper: hyper,
                                 normW: try model.attnHcNorm(layer: L),
@@ -3040,33 +3058,56 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                             x: attnIn, y: idxQK, m: idxRows, n: D,
                             groupSize: attnGroup)
                 cb1.commit()
+                totalCb1Nanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tCb1
                 waitForCompletion(cb1)
-                // CPU: query finalize + block finalize into the pooled cache.
-                let completed = try q38IndexerPost(layer: L, position: position)
-                if completed > 0 {
-                    runSync { cb in
-                        q38.encodeBlockScore(
-                            commandBuffer: cb, q: idxQ, k: self.q38PooledKeys[L],
-                            scores: scores, headDim: idxDim, nHeads: idxHeads,
-                            blockCount: completed)
-                    }
-                }
-                // CPU: top-k + tail -> sel.
-                let selCount = q38SelectTokens(layer: L, position: position,
-                                               completed: completed)
-                // CB2: gather subset -> dense attention -> gate -> o_proj ->
+                // Dense fast path: while every complete block fits the indexer
+                // budget the reference selection is exactly the causal prefix
+                // (`k == numComplete` keeps every block and the tail appends
+                // the rest), so block scoring, the CPU top-k and the gather are
+                // all unnecessary — attention reads the KV cache directly.
+                // Positions past the budget keep the sparse indexer path.
+                let blockTopK = cfg.indexerBudget / cfg.indexerCompressRatio
+                let denseWindow = position + 1 <= blockTopK * cfg.indexerCompressRatio
+                // CPU: query finalize (sparse path only; the pooled keys must
+                // still be finalized for later tokens) + block finalize.
+                let completed = try q38IndexerPost(layer: L, position: position,
+                                                   needsQueryScores: !denseWindow)
+                // CB2: (gather subset ->) attention -> gate -> o_proj ->
                 // attn inject -> mlp hyper-mix -> router.
                 let cb2 = ctx.queue.makeCommandBuffer()!
                 let base = kv.gatherBase(layer: L)
-                q38.encodeGatherRows(commandBuffer: cb2, src: base.k, sel: sel,
-                                     dst: compactK, rowElems: Int(kvDim),
-                                     rows: selCount)
-                q38.encodeGatherRows(commandBuffer: cb2, src: base.v, sel: sel,
-                                     dst: compactV, rowElems: Int(kvDim),
-                                     rows: selCount)
+                let attnK: MTLBuffer
+                let attnV: MTLBuffer
+                let selCount: Int
+                if denseWindow {
+                    attnK = base.k
+                    attnV = base.v
+                    selCount = position + 1
+                } else {
+                    if completed > 0 {
+                        runSync { cb in
+                            q38.encodeBlockScore(
+                                commandBuffer: cb, q: idxQ, k: self.q38PooledKeys[L],
+                                scores: scores, headDim: idxDim, nHeads: idxHeads,
+                                blockCount: completed)
+                        }
+                    }
+                    // CPU: top-k + tail -> sel.
+                    selCount = q38SelectTokens(layer: L, position: position,
+                                               completed: completed)
+                    q38.encodeGatherRows(commandBuffer: cb2, src: base.k, sel: sel,
+                                         dst: compactK, rowElems: Int(kvDim),
+                                         rows: selCount)
+                    q38.encodeGatherRows(commandBuffer: cb2, src: base.v, sel: sel,
+                                         dst: compactV, rowElems: Int(kvDim),
+                                         rows: selCount)
+                    attnK = compactK
+                    attnV = compactV
+                }
+                let tCb2 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
                 attention.encodeFull(
                     commandBuffer: cb2, q: qScratch,
-                    k: compactK, v: compactV, out: attnOut,
+                    k: attnK, v: attnV, out: attnOut,
                     headDim: UInt32(headDim),
                     numQHeads: UInt32(cfg.numHeads),
                     numKVHeads: UInt32(numKV),
@@ -3104,6 +3145,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     numExperts: UInt32(cfg.numExperts), d: D, topK: topK,
                     weightBits: routerWeightBits)
                 cb2.commit()
+                totalCb2Nanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tCb2
                 waitForCompletion(cb2)
             }
 
@@ -3115,6 +3157,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 experts[i] = min(Int(idxPtr[i]), cfg.numExperts - 1)
             }
             let routedOffsets = model.routedExpertOffsets(layer: L)
+            let tShared = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
             let sharedCB = ctx.queue.makeCommandBuffer()!
             let proj = sharedProjViews[L]
             try! shared.encode(commandBuffer: sharedCB, x: mlpIn,
@@ -3152,6 +3195,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 commandBuffer: sharedCB, y: h1Buf,
                 gate: sharedScalarGateBuf!, count: cfg.hiddenSize)
             sharedCB.commit()
+            totalCb2Nanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tShared
             if rdadviseEnabled, rdadvisePolicyMode != .off {
                 do {
                     let estimated = try model.routedExpertAdviceByteEstimate(
@@ -3173,9 +3217,15 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 }
             }
             let tIoStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-            let blobs = try await model.fetchRoutedExperts(layer: L, experts: experts)
+            let fetchResult = try await model.fetchRoutedExpertsReportingStats(
+                layer: L, experts: experts)
             totalIoNanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tIoStart
+            totalExpertCacheHits &+= UInt64(fetchResult.stats.hits)
+            totalExpertCacheMisses &+= UInt64(fetchResult.stats.misses)
+            totalExpertReadBytes &+= fetchResult.stats.bytesRead
+            let blobs = fetchResult.views
             let routedBufs = blobs.map { $0.buffer }
+            let tRouted = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
             let routedCB = ctx.queue.makeCommandBuffer()!
             let argBuf = moe.makeReusedRoutedArgumentBuffer(
                 routedBlobs: routedBufs, topK: topK)
@@ -3192,6 +3242,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                 sub: h2Buf, inj: inj,
                                 d: cfg.hiddenSize, h: hc)
             routedCB.commit()
+            totalCb2Nanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tRouted
             pendingQ38.append(sharedCB)
             pendingQ38.append(routedCB)
         }
@@ -3201,10 +3252,16 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             if let err = cb.error { print("CB error: \(err)") }
         }
 
-        // Mixer closes the stream (no block inject, no final norm).
+        // Mixer closes the stream (no block inject, no final norm) and shares
+        // one host wait with the head: the serial queue keeps the order, and a
+        // single command buffer keeps that dependency inside the GPU.
         let mixerNorm = model.mixerHcNorm
         let mixerDown = model.mixerDown
         let mixerUp = model.mixerUp
+        let lm = model.lmHead
+        let useFusedHeadForThisToken = emitHead && useFusedGreedyHead
+            && outputMode == .greedyIfAvailable
+        let tHead = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
         runSync { cb in
             try! self.q38HyperMix(cb, hyper: hyper,
                                   normW: mixerNorm,
@@ -3213,14 +3270,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                   injectW: nil, mixedOut: self.normed,
                                   injOut: nil,
                                   groupSize: attnGroup)
-        }
-
-        if emitHead {
-            let useFusedHeadForThisToken = useFusedGreedyHead && outputMode == .greedyIfAvailable
-            let lm = model.lmHead
-            if useFusedHeadForThisToken {
-                let tHead = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-                runSync { cb in
+            if emitHead {
+                if useFusedHeadForThisToken {
                     self.fusionHead.encodeGreedyDecode(
                         commandBuffer: cb, hidden: self.normed,
                         normWeight: self.normed, normOffset: 0,
@@ -3230,12 +3281,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                         outToken: self.greedyTokenBuf,
                         d: D, vocab: UInt32(self.cfg.vocabSize),
                         rmsEps: eps, groupSize: attnGroup, skipNorm: true)
-                }
-                totalHeadFusedNanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tHead
-                lastGreedyToken = greedyTokenBuf.contents().load(as: UInt32.self)
-            } else {
-                let tHead = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-                runSync { cb in
+                } else {
                     self.int4.encode(commandBuffer: cb,
                                      weights: lm.buffer,
                                      weightsOffset: Int(lm.offset),
@@ -3247,6 +3293,13 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                      m: UInt32(self.cfg.vocabSize), n: D,
                                      groupSize: attnGroup)
                 }
+            }
+        }
+        if emitHead {
+            if useFusedHeadForThisToken {
+                totalHeadFusedNanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tHead
+                lastGreedyToken = greedyTokenBuf.contents().load(as: UInt32.self)
+            } else {
                 totalHeadNanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tHead
             }
         }

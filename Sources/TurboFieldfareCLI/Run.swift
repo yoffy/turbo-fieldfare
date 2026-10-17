@@ -106,6 +106,16 @@ public func run(args: Args,
             lines += "  cb2 encode+commit: " + ms(runner.totalCb2Nanos) + " ms\n"
             lines += "  unaccounted (GPU waits): "
             lines += String(format: "%.1f", total - accounted) + " ms\n"
+            let fetches = runner.totalExpertCacheHits + runner.totalExpertCacheMisses
+            if fetches > 0 {
+                let hitRate = 100 * Double(runner.totalExpertCacheHits) / Double(fetches)
+                let mb = Double(runner.totalExpertReadBytes) / 1_048_576
+                lines += "  expert cache:      "
+                lines += "\(runner.totalExpertCacheHits) hit / "
+                lines += "\(runner.totalExpertCacheMisses) miss ("
+                lines += String(format: "%.1f", hitRate) + "%), "
+                lines += String(format: "%.0f", mb) + " MB read\n"
+            }
             stderr.write(Data(lines.utf8))
         }
         if !args.quiet {
