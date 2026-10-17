@@ -426,7 +426,7 @@ public enum Qwen38Reference {
                     // torch.remainder on the int64 `mixed` value: floored
                     // modulo, so a wrapping-negative product still yields a
                     // non-negative row (differs from unsigned `%`).
-                    var r = Int(bitPattern: mixed) % v
+                    var r = Int(Int64(bitPattern: mixed) % Int64(v))
                     if r < 0 { r += v }
                     let id = r + headOffsets[headStart + h]
                     row.append(id)
