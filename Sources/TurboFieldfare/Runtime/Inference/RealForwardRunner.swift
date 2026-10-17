@@ -4613,6 +4613,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 if L == 47 {
                     q38DebugRefCheckMixer(hyper: hyper, mixed: self.normed)
                 }
+                if sweepQ38 && position == deepPos && L == 47 {
+                    q38DebugRefCheckMixer(hyper: hyper, mixed: self.normed)
+                }
                 if sweepQ38 && L > 0 {
                     q38DebugRefCheckRouter(mlpIn: mlpIn, layer: L)
                     if cfg.layerIsLinear(L) {
