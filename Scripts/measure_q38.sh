@@ -106,7 +106,7 @@ main() {
 
   if [[ "$skip_build" != "1" ]]; then
     echo "== build"
-    if ! swift build -c release; then
+    if ! swift build -c release --target TurboFieldfareServer; then
       echo "!! build failed"
       return 1
     fi
