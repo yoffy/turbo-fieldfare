@@ -61,6 +61,10 @@ static inline float gdn_silu(float x) {
     return x / (1.0f + exp(-x));
 }
 
+static inline float gdn_sigmoid(float x) {
+    return 1.0f / (1.0f + exp(-x));
+}
+
 static inline float gdn_softplus(float x) {
     // log1p(exp(x)) with the standard large-x shortcut; matches
     // mlx.nn.softplus to FP32 precision.
@@ -463,10 +467,11 @@ kernel void gdn_delta_step_prefill(
 }
 
 // ----------------------------------------------------------------------------
-// Gated output norm: out = rmsnorm(y; weight, eps) * silu(z), per value head.
+// Gated output norm: out = rmsnorm(y; weight, eps) * gate(z), per value head.
 // One threadgroup per (head, row), 128 threads. Norm statistics span one
-// head's Dv elements; silu/product in FP32 (matches the reference's
-// _precise_swiglu).
+// head's Dv elements; the gate/product in FP32. `gateMode` selects the
+// config's `output_gate_type`: 0 = silu(z) (Qwen 3.5/3.6 `hidden_act`),
+// 1 = sigmoid(z) (Qwen 3.8).
 // ----------------------------------------------------------------------------
 kernel void gdn_gated_norm(
     device const half*   y        [[buffer(0)]],   // [T, Hv * Dv]
@@ -475,6 +480,7 @@ kernel void gdn_gated_norm(
     device half*         out      [[buffer(3)]],   // [T, Hv * Dv]
     constant uint&       vHeads   [[buffer(4)]],
     constant uint&       valueDim [[buffer(5)]],
+    constant uint&       gateMode [[buffer(6)]],
     uint2 tg  [[threadgroup_position_in_grid]],
     uint2 tpos [[thread_position_in_threadgroup]],
     uint  simd_lane [[thread_index_in_simdgroup]],
@@ -509,7 +515,8 @@ kernel void gdn_gated_norm(
 
     for (uint i = tid; i < Dv; i += 128u) {
         const float normed = float(y[base + i]) * invRms * float(weight[i]);
-        const float gate = gdn_silu(float(z[base + i]));
+        const float gate = (gateMode != 0u) ? gdn_sigmoid(float(z[base + i]))
+                                            : gdn_silu(float(z[base + i]));
         out[base + i] = half(normed * gate);
     }
 }

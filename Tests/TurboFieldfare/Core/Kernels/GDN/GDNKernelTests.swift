@@ -279,6 +279,55 @@ import TurboFieldfareValidationSupport
         #expect(maxStateErr <= 5e-2, "state divergence \(maxStateErr)")
     }
 
+    /// `output_gate_type = "sigmoid"` (Qwen 3.8) selects `sigmoid(z)` in the
+    /// gated output norm; `GDN(outGateSigmoid:)` must switch it away from the
+    /// Qwen 3.5/3.6 `silu(z)` default.
+    @Test func gatedNormSigmoidGateMatchesReference() throws {
+        let cfg = Self.cfg
+        let rows = 3
+        let ctx = try MetalContext()
+        let gdn = try GDN(context: ctx, config: cfg, outGateSigmoid: true)
+        var rng = SeedTree(0x9D3).key("gdn-gated-norm-\(rows)")
+        let y = (0..<(rows * cfg.valueDim)).map { _ in
+            Float(Float16(rng.uniform(-2.0, 2.0)))
+        }
+        let z = (0..<(rows * cfg.valueDim)).map { _ in
+            Float(Float16(rng.uniform(-6.0, 6.0)))
+        }
+        let normW = (0..<cfg.valueHeadDim).map { _ in
+            Self.bf16Value(rng.uniform(0.5, 1.5))
+        }
+        guard let yBuf = Fp16Buffer.make(ctx.device, values: y),
+              let zBuf = Fp16Buffer.make(ctx.device, values: z),
+              let wBuf = Self.makeBF16Buffer(ctx.device, values: normW),
+              let outBuf = Fp16Buffer.make(ctx.device, count: rows * cfg.valueDim),
+              let cb = ctx.queue.makeCommandBuffer() else {
+            Issue.record("Failed to allocate buffers"); return
+        }
+        gdn.encodeGatedNorm(commandBuffer: cb, y: yBuf, z: zBuf,
+                            weight: wBuf, weightOffset: 0,
+                            out: outBuf, rows: rows)
+        cb.commit()
+        cb.waitUntilCompleted()
+        let got = Self.readHalves(outBuf, count: rows * cfg.valueDim)
+        for row in 0..<rows {
+            for h in 0..<cfg.numVHeads {
+                let base = row * cfg.valueDim + h * cfg.valueHeadDim
+                var sumsq: Float = 0
+                for i in 0..<cfg.valueHeadDim { sumsq += y[base + i] * y[base + i] }
+                let invRms = 1 / sqrtf(sumsq / Float(cfg.valueHeadDim) + 1e-6)
+                for i in 0..<cfg.valueHeadDim {
+                    let sigmoid = 1 / (1 + expf(-z[base + i]))
+                    let want = y[base + i] * invRms * normW[i] * sigmoid
+                    let tolerance = max(1e-3, abs(want) * 4e-3)
+                    #expect(abs(got[base + i] - want) <= tolerance,
+                            "row \(row) head \(h) element \(i): got "
+                                + "\(got[base + i]), want \(want)")
+                }
+            }
+        }
+    }
+
     @Test func prefillChunkMatchesSequentialDecode() throws {
         let cfg = Self.cfg
         let rows = 7

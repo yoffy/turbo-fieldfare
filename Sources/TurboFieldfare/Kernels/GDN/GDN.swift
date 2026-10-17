@@ -26,6 +26,9 @@ final class GDN {
     private let inProjSpecializedG32PSO: MTLComputePipelineState?
     /// Group width of the `in_proj_*` weights (64 legacy, 32 Qwen 3.8 base).
     private let projGroupSize: Int
+    /// `output_gate_type == "sigmoid"` (Qwen 3.8); false selects `silu(z)`
+    /// (Qwen 3.5/3.6), passed to `gdn_gated_norm` as buffer 6.
+    let outGateSigmoid: Bool
 
     let config: LinearAttentionConfig
 
@@ -35,10 +38,12 @@ final class GDN {
     /// specialized, so the runtime path must not be the only one available.
     init(context: MetalContext, config: LinearAttentionConfig,
          specializedHiddenSize: Int? = nil,
-         projGroupSize: Int = 64) throws {
+         projGroupSize: Int = 64,
+         outGateSigmoid: Bool = false) throws {
         precondition(projGroupSize == 32 || projGroupSize == 64,
                      "unsupported projGroupSize \(projGroupSize)")
         self.projGroupSize = projGroupSize
+        self.outGateSigmoid = outGateSigmoid
         precondition(config.keyHeadDim > 0 && config.keyHeadDim % 32 == 0,
                      "keyHeadDim must be a positive multiple of 32")
         precondition(config.keyHeadDim / 32 <= 8,
@@ -292,7 +297,8 @@ final class GDN {
         encoder.endEncoding()
     }
 
-    /// out = rmsnorm(y; weight) * silu(z), per value head, `rows` rows.
+    /// out = rmsnorm(y; weight) * gate(z) (silu or sigmoid per
+    /// `outGateSigmoid`), per value head, `rows` rows.
     func encodeGatedNorm(commandBuffer: MTLCommandBuffer,
                          y: MTLBuffer, yOffset: Int = 0,
                          z: MTLBuffer, zOffset: Int = 0,
@@ -307,8 +313,10 @@ final class GDN {
         encoder.setBuffer(out, offset: outOffset, index: 3)
         var vHeads = UInt32(config.numVHeads)
         var valueDim = UInt32(config.valueHeadDim)
+        var gateMode = UInt32(outGateSigmoid ? 1 : 0)
         encoder.setBytes(&vHeads, length: MemoryLayout<UInt32>.size, index: 4)
         encoder.setBytes(&valueDim, length: MemoryLayout<UInt32>.size, index: 5)
+        encoder.setBytes(&gateMode, length: MemoryLayout<UInt32>.size, index: 6)
         encoder.dispatchThreadgroups(
             MTLSize(width: config.numVHeads, height: rows, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))

@@ -446,6 +446,18 @@ struct ArchInfo: Sendable, Equatable {
         let tie = (tc["tie_word_embeddings"] as? Bool) ?? false
         let act = (tc["hidden_act"] as? String) ?? "silu"
         let headDim = try i("head_dim")
+        // The runtime gates the Gated-DeltaNet output norm with `sigmoid` for
+        // this family (Qwen 3.5/3.6 use `silu`); the pinned production
+        // checkpoint must agree. The 2560x48 guard keeps synthetic configs
+        // exempt, mirroring `crossCheckProductionQwen38`.
+        let outGate = (tc["output_gate_type"] as? String) ?? act
+        if (try i("hidden_size")) == 2560, (try i("num_hidden_layers")) == 48,
+           outGate != "sigmoid" {
+            throw RepackError.configJsonInvalid(
+                path: configPath,
+                detail: "production qwen4_exp requires output_gate_type "
+                    + "\"sigmoid\", got \"\(outGate)\"")
+        }
 
         let arch = ArchInfo(
             hiddenSize: try i("hidden_size"),

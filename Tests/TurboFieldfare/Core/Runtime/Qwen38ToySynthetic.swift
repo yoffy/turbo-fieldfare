@@ -580,6 +580,7 @@ extension ArchConfig {
                 numKHeads: 2, numVHeads: 4,
                 keyHeadDim: 32, valueHeadDim: 32,
                 convKernelSize: 4),
+            gdnOutGateSigmoid: true,   // production 3.8 (`output_gate_type`)
             hcCount: 2,
             hcLowrank: 32,
             pleEmbedDim: 128,

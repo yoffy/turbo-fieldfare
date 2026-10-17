@@ -97,6 +97,10 @@ public struct ArchConfig: Sendable, Equatable {
     public let ropeNeoxSubdim: Bool
     /// Gated-DeltaNet dimensions for layers with mask value 2.
     public let linearAttention: LinearAttentionConfig
+    /// Gated-DeltaNet output-norm gate activation. False: `silu(z)` (Qwen
+    /// 3.5/3.6, i.e. `hidden_act`). True: `sigmoid(z)`, selected by
+    /// `output_gate_type = "sigmoid"` in the Qwen 3.8 text config.
+    public let gdnOutGateSigmoid: Bool
     /// Gated-residual (hyper-connection) branch count and bottleneck rank.
     /// Zero for architectures without hyper-connections.
     public let hcCount: Int
@@ -145,6 +149,7 @@ public struct ArchConfig: Sendable, Equatable {
         sharedExpertGated: Bool = false,
         ropeNeoxSubdim: Bool = false,
         linearAttention: LinearAttentionConfig = .none,
+        gdnOutGateSigmoid: Bool = false,
         hcCount: Int = 0,
         hcLowrank: Int = 0,
         pleEmbedDim: Int = 0,
@@ -187,6 +192,7 @@ public struct ArchConfig: Sendable, Equatable {
         self.sharedExpertGated = sharedExpertGated
         self.ropeNeoxSubdim = ropeNeoxSubdim
         self.linearAttention = linearAttention
+        self.gdnOutGateSigmoid = gdnOutGateSigmoid
         self.hcCount = hcCount
         self.hcLowrank = hcLowrank
         self.pleEmbedDim = pleEmbedDim
@@ -376,6 +382,7 @@ public struct ArchConfig: Sendable, Equatable {
             numKHeads: 16, numVHeads: 48,
             keyHeadDim: 128, valueHeadDim: 128,
             convKernelSize: 4),
+        gdnOutGateSigmoid: true,
         hcCount: 4,
         hcLowrank: 320,
         pleEmbedDim: 2560,
