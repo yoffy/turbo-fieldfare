@@ -4614,6 +4614,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 // QSA-oOut for full layers. Catches single-tensor repack
                 // corruption hiding in unchecked layers.
                 if sweepQ38 && L > 0 {
+                    q38DebugRefCheckRouter(mlpIn: mlpIn, layer: L)
                     if cfg.layerIsLinear(L) {
                         if let qr = gdnQKVRaw {
                             q38DebugProbe("qkvRaw.L\(L)", qr, cfg.linearAttention.qkvDim)
