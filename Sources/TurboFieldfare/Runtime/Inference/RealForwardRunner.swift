@@ -3620,7 +3620,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     /// real weights vs GPU `normed`. Covers hc_norm/down/up/silu/sigmoid/
     /// mean -- the same machinery every layer's hyper-mix uses, verified
     /// here once with 48-deep real hyper state.
-    private func q38DebugRefCheckMixer(hyper: MTLBuffer, mixed: MTLBuffer) {
+    private func q38DebugRefCheckMixer(hyper: MTLBuffer, mixed: MTLBuffer,
+                                       position: Int) {
         let hc = cfg.hcCount
         let d = cfg.hiddenSize
         let hcHidden = hc * d
@@ -3650,7 +3651,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             md += dd; mx = max(mx, dd); sa += abs(ref.mixed[i])
         }
         let rel = (md / Float(d)) / max(1e-6, sa / Float(d))
-        q38DebugDump("refMixer", "rel=\(rel) maxDiff=\(mx) \(rel < 0.08 ? "PASS" : "FAIL")")
+        q38DebugDump("refMixer.p\(position)", "rel=\(rel) maxDiff=\(mx) \(rel < 0.08 ? "PASS" : "FAIL")")
     }
 
     /// Raw INT4-g32 dequant of a full view to row-major [Float] (for the
@@ -4610,12 +4611,6 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     let msg = "[q38dbg] router wsum=\(wSum) imax=\(iMax) uniq=\(seen.count)\n"
                     if let d = msg.data(using: .utf8) { FileHandle.standardError.write(d) }
                 }
-                if L == 47 {
-                    q38DebugRefCheckMixer(hyper: hyper, mixed: self.normed)
-                }
-                if sweepQ38 && position == deepPos && L == 47 {
-                    q38DebugRefCheckMixer(hyper: hyper, mixed: self.normed)
-                }
                 if sweepQ38 && L > 0 {
                     q38DebugRefCheckRouter(mlpIn: mlpIn, layer: L)
                     if cfg.layerIsLinear(L) {
@@ -4669,11 +4664,16 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                   injOut: nil,
                                   groupSize: attnGroup)
         }
-        if dbgQ38 && position == 0 {
+        if dbgQ38 && (position == 0 || position == deepPos) {
             q38DebugProbe("mixer", self.normed, self.cfg.hiddenSize)
-            q38DebugRefCheckMixer(hyper: hyper, mixed: self.normed)
+            q38DebugRefCheckMixer(hyper: hyper, mixed: self.normed, position: position)
+        }
+        if dbgQ38 && position == 0 {
             q38DebugRefCheckHead()
             q38DebugRefCheckRope()
+        }
+        if dbgQ38 && position == deepPos {
+            q38DebugRefCheckHead()
         }
 
         if emitHead {

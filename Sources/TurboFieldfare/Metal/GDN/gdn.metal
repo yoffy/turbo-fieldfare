@@ -10,7 +10,7 @@ using namespace metal;
 // C = 8192 conv channels, K = 4 taps, Hk = 16 x Dk = 128, Hv = 32 x Dv = 128):
 //   mixed_qkv = in_proj_qkv(x)                       (existing INT4 GEMV)
 //   conv_out  = silu(causal_depthwise_conv(mixed))    gdn_conv_mix_*
-//   q, k      = per-head no-weight RMS norm + scale   gdn_qk_norm_*
+//   q, k      = per-head no-weight L2 norm + scale    gdn_qk_norm_*
 //   y, S      = gated delta rule recurrence           gdn_delta_*
 //   out       = rmsnorm(y) * silu(z)                  gdn_gated_norm_*
 //   out_proj(out)                                     (existing INT4 GEMV)
@@ -268,9 +268,10 @@ kernel void gdn_conv_tail_update(
 }
 
 // ----------------------------------------------------------------------------
-// Per-head no-weight RMS norm over q and k slices of conv_out, with the
-// delta-rule scales folded in: q *= 1/Dk (inv_scale^2), k *= 1/sqrt(Dk).
-// One threadgroup per (head, row); head_dim <= 1024 threads.
+// Per-head no-weight L2 norm (FLA `l2norm`: eps inside the root in sum
+// space) over q and k slices of conv_out, with the delta-rule scales folded
+// in: q *= 1/sqrt(Dk) (head-dim query scale), k *= 1. One threadgroup per
+// (head, row); head_dim <= 1024 threads.
 // conv_out layout per row: [q: Hk*Dk][k: Hk*Dk][v: Hv*Dv].
 // ----------------------------------------------------------------------------
 kernel void gdn_qk_norm(
@@ -309,8 +310,10 @@ kernel void gdn_qk_norm(
         partial[0] = total;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float mean = partial[0] / float(Dk);
-    const float invRms = rsqrt(mean + kGdnRmsEps);
+    // sum-space eps: rsqrt(sum + eps) == rsqrt((sum + eps) / Dk) * rsqrt(Dk).
+    // Using mean-space eps instead under-scales low-energy heads by up to
+    // sqrt(Dk) and diverges from the reference on near-dead heads.
+    const float invRms = rsqrt((partial[0] + kGdnRmsEps) / float(Dk));
     const float scale = isQ ? (1.0f / float(Dk)) : rsqrt(float(Dk));
 
     for (uint i = tid; i < Dk; i += 128u) {
