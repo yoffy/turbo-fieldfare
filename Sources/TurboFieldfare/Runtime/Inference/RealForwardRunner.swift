@@ -294,6 +294,13 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         self.model = model
         self.ctx = context
         self.cfg = model.config
+        // One token routes topKExperts experts through the per-layer cache, so a
+        // smaller cache cannot hold a single token's working set. Reject it here
+        // instead of trapping in the streamer's plan step on the first fetch.
+        if case .pread(let slotCount) = model.streamingMode, slotCount < cfg.topKExperts {
+            throw ModelError.expertCacheSlotsTooSmall(slotCount: slotCount,
+                                                      topKExperts: cfg.topKExperts)
+        }
         self.maxContext = maxContext
         self.useFusedGreedyHead = runtimeConfiguration.headPath == .fusedRows
         self.prefillAttentionPath = runtimeConfiguration.prefillAttentionPath

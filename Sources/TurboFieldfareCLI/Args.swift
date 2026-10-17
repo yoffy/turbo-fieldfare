@@ -91,7 +91,8 @@ extension Args {
                                 bounded, or adaptive (default off).
       --expert-cache-slots <n>  Routed-expert cache slots per layer: 8, 16,
                                 24, or 32 (default 16). More slots raise the
-                                hit rate but use more memory.
+                                hit rate but use more memory; the count must
+                                be at least the routed top-k (10 on Qwen 3.8).
       --quiet                   Suppress the timing footer.
       --help                    Show this message.
     """

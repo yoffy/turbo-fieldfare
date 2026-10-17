@@ -466,6 +466,7 @@ enum ModelError: Error, CustomStringConvertible, Equatable {
     case unknownFlag(name: String)
     case archMismatch(field: String, expected: String, actual: String)
     case expertStrideNotPageAligned(stride: UInt64, pageSize: Int)
+    case expertCacheSlotsTooSmall(slotCount: Int, topKExperts: Int)
     case missingFile(name: String)
     case checksumMismatch(file: String)
     case tensorNotFound(name: String)
@@ -489,6 +490,9 @@ enum ModelError: Error, CustomStringConvertible, Equatable {
             return "manifest.arch.\(field) = \(act); expected \(exp)"
         case .expertStrideNotPageAligned(let s, let p):
             return "expertStride \(s) is not a multiple of page size \(p)"
+        case .expertCacheSlotsTooSmall(let s, let k):
+            return "expert cache slots \(s) is below the routed top-k \(k): "
+                + "each token fetches \(k) experts per layer, so the cache needs at least \(k) slots"
         case .missingFile(let n):
             return "model.gturbo is missing required file \(n)"
         case .checksumMismatch(let f):
