@@ -252,6 +252,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     private let q38PleDots: MTLBuffer?
     private let q38PleGate: MTLBuffer?
     private let q38PleGated: MTLBuffer?
+    private let q38PleNormed: MTLBuffer?
     private let q38PleConvOut: MTLBuffer?
     private let q38PleConvState: MTLBuffer?
     private let q38PleEos: Int32
@@ -372,7 +373,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         if cfg.hasLinearAttentionLayers {
             self.gdn = try GDN(context: context, config: cfg.linearAttention,
                                specializedHiddenSize: cfg.hiddenSize,
-                               projGroupSize: model.attentionGroupSize)
+                               projGroupSize: model.attentionGroupSize,
+                               outGateSigmoid: cfg.gdnOutGateSigmoid)
             self.gdnState = try GDNStateManager(device: context.device, config: cfg)
         } else {
             self.gdn = nil
@@ -513,6 +515,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             self.q38PleDots = try buf(hc, MemoryLayout<Float>.stride)
             self.q38PleGate = try buf(hc, MemoryLayout<Float>.stride)
             self.q38PleGated = try buf(hcHidden)
+            self.q38PleNormed = try buf(hcHidden)
             self.q38PleConvOut = try buf(hcHidden)
             self.q38PleConvState = try buf(pleConvStateLen * hcHidden)
             memset(self.q38PleConvState!.contents(), 0, self.q38PleConvState!.length)
@@ -543,6 +546,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             self.q38PleDots = nil
             self.q38PleGate = nil
             self.q38PleGated = nil
+            self.q38PleNormed = nil
             self.q38PleConvOut = nil
             self.q38PleConvState = nil
             self.q38PleEos = 0
@@ -3114,8 +3118,11 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 for j in 0..<hV { ms += core[h * hV + j] * core[h * hV + j] }
                 let inv = 1.0 / sqrt(ms / Float(hV) + 1e-6)
                 for j in 0..<hV {
-                    let sz: Float = zH[h][j] / (1.0 + exp(-zH[h][j]))
-                    gated[h * hV + j] = core[h * hV + j] * inv * gnWf[j] * sz
+                    let zc = zH[h][j]
+                    let act: Float = cfg.gdnOutGateSigmoid
+                        ? 1.0 / (1.0 + exp(-zc))
+                        : zc / (1.0 + exp(-zc))
+                    gated[h * hV + j] = core[h * hV + j] * inv * gnWf[j] * act
                 }
             }
             let o = q38DebugGEMV4(view: try model.linearOutProj(layer: L),
@@ -3840,7 +3847,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 convOut[c] = acc / (1.0 + exp(-acc)) // silu
             }
             var expect = [Float](repeating: 0, count: hcHidden)
-            for i in 0..<hcHidden { expect[i] = normed[i] + convOut[i] }
+            // Upstream: output = gated_value + silu(conv(norm_conv(gated)))
+            // -- the added base is the *pre-norm* gated value (`scaled`), not
+            // the conv input (`normed`).
+            for i in 0..<hcHidden { expect[i] = scaled[i] + convOut[i] }
             let gPtr = pleGated.contents().assumingMemoryBound(to: UInt16.self)
             var md: Float = 0, mx: Float = 0, sa: Float = 0
             for i in 0..<hcHidden {
@@ -4050,7 +4060,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
               let pleEmbed = q38PleEmbed, let pleKey = q38PleKey,
               let pleValue = q38PleValue, let pleQuery = q38PleQuery,
               let pleDots = q38PleDots, let pleGate = q38PleGate,
-              let pleGated = q38PleGated, let pleConvOut = q38PleConvOut,
+              let pleGated = q38PleGated, let pleNormed = q38PleNormed,
+              let pleConvOut = q38PleConvOut,
               let pleConvState = q38PleConvState, let hyper = q38Hyper else {
             preconditionFailure("qwen38 PLE without scratch")
         }
@@ -4146,13 +4157,15 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             q38.encodeNormGrouped(commandBuffer: cb, x: pleGated,
                                   weight: nConvW.buffer,
                                   weightOffset: Int(nConvW.offset),
-                                  out: pleGated, dim: UInt32(D), groups: hc,
+                                  out: pleNormed, dim: UInt32(D), groups: hc,
                                   eps: eps)
             q38.encodeShortConvStep(
-                commandBuffer: cb, state: pleConvState, input: pleGated,
+                commandBuffer: cb, state: pleConvState, input: pleNormed,
                 weight: convW.buffer, weightOffset: Int(convW.offset),
                 out: pleConvOut, channels: hcHidden, kernel: 4,
                 dilation: ngramSize, stateLen: 9)
+            // Upstream: output = gated_value + silu(conv(norm_conv(gated_value))),
+            // so the conv result stacks onto the *pre-norm* gated value.
             elementwise.encodeResidualAdd(commandBuffer: cb,
                                                 hidden: pleGated,
                                                 delta: pleConvOut,
@@ -4166,6 +4179,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             q38DebugProbe("pleEmbed", pleEmbed, cfg.pleEmbedDim)
             q38DebugProbe("pleValue", pleValue, D)
             q38DebugProbe("pleGated", pleGated, hcHidden)
+            q38DebugProbe("pleNormed", pleNormed, hcHidden)
             q38DebugProbe("pleConvOut", pleConvOut, hcHidden)
             if q38PleHistory.isEmpty {
                 q38DebugRefCheckPLE(token: token, pleLayer: L)
