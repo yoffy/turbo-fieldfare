@@ -4610,9 +4610,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     let msg = "[q38dbg] router wsum=\(wSum) imax=\(iMax) uniq=\(seen.count)\n"
                     if let d = msg.data(using: .utf8) { FileHandle.standardError.write(d) }
                 }
-                // All-layer sweep (opt-in): GDN-oOut for linear layers,
-                // QSA-oOut for full layers. Catches single-tensor repack
-                // corruption hiding in unchecked layers.
+                if L == 47 {
+                    q38DebugRefCheckMixer(hyper: hyper, mixed: self.normed)
+                }
                 if sweepQ38 && L > 0 {
                     q38DebugRefCheckRouter(mlpIn: mlpIn, layer: L)
                     if cfg.layerIsLinear(L) {
